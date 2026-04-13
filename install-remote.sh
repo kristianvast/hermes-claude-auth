@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # One-line installer for hermes-claude-auth.
-# Usage: curl -fsSL https://raw.githubusercontent.com/kristianvastveit/hermes-claude-auth/main/install-remote.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/kristianvast/hermes-claude-auth/main/install-remote.sh | bash
 
-REPO="https://github.com/kristianvastveit/hermes-claude-auth.git"
+REPO="https://github.com/kristianvast/hermes-claude-auth.git"
 TMPDIR="$(mktemp -d)"
 
 cleanup() { rm -rf "$TMPDIR"; }

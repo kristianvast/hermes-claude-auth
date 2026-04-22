@@ -65,29 +65,17 @@ Installed through a `sitecustomize.py` MetaPathFinder hook, so it runs at interp
 
 ### Auth issues
 
-- **`Anthropic 401 authentication failed`** or **`No Anthropic credentials found`**: Hermes reads Claude subscription credentials from `~/.claude/.credentials.json`. If Claude Code is authenticated (e.g. in macOS Keychain) but that file is missing or stale, Hermes fails even when Claude Code itself works. Fix:
+- **`Anthropic 401 authentication failed`** or **`No Anthropic credentials found`**: Hermes reads Claude subscription credentials from `~/.claude/.credentials.json`. If Claude Code is authenticated (e.g. in macOS Keychain) but that file is missing or stale, Hermes fails even when Claude Code itself works.
+
+  On macOS, `install.sh` v1.1.1+ auto-mirrors the `Claude Code-credentials` Keychain entry into `~/.claude/.credentials.json` on every run, so re-running the installer is usually enough. Full fix:
 
   1. Refresh Claude subscription login:
      ```bash
      claude auth login --claudeai
      ```
-  2. **macOS only** — mirror the Keychain `Claude Code-credentials` entry into the file Hermes reads:
+  2. Re-run the installer to re-mirror credentials (macOS) and reload the patch:
      ```bash
-     python3 - <<'PY'
-     import subprocess
-     from pathlib import Path
-
-     secret = subprocess.check_output(
-         ['security', 'find-generic-password', '-s', 'Claude Code-credentials', '-w'],
-         text=True,
-     ).strip()
-
-     cred_path = Path.home() / '.claude' / '.credentials.json'
-     cred_path.parent.mkdir(parents=True, exist_ok=True)
-     cred_path.write_text(secret)
-     cred_path.chmod(0o600)
-     print(f'wrote {cred_path}')
-     PY
+     ./install.sh
      ```
   3. Remove stale `ANTHROPIC_TOKEN` / `ANTHROPIC_API_KEY` values from `~/.hermes/.env` — they can override subscription auth.
   4. Reset cached credentials:
@@ -99,7 +87,26 @@ Installed through a `sitecustomize.py` MetaPathFinder hook, so it runs at interp
      hermes chat -q 'Reply with exactly: AUTH TEST OK' --provider anthropic -m claude-sonnet-4-6 -Q
      ```
 
-  Credit: this macOS Keychain mirror step was written up by [@DrQbz](https://github.com/DrQbz) in [issue #5](https://github.com/kristianvast/hermes-claude-auth/issues/5).
+  If the auto-mirror doesn't work (e.g. your Keychain entry is under a different service name), mirror it manually:
+  ```bash
+  python3 - <<'PY'
+  import subprocess
+  from pathlib import Path
+
+  secret = subprocess.check_output(
+      ['security', 'find-generic-password', '-s', 'Claude Code-credentials', '-w'],
+      text=True,
+  ).strip()
+
+  cred_path = Path.home() / '.claude' / '.credentials.json'
+  cred_path.parent.mkdir(parents=True, exist_ok=True)
+  cred_path.write_text(secret)
+  cred_path.chmod(0o600)
+  print(f'wrote {cred_path}')
+  PY
+  ```
+
+  Credit: the macOS Keychain mirror approach was written up by [@DrQbz](https://github.com/DrQbz) in [issue #5](https://github.com/kristianvast/hermes-claude-auth/issues/5) and is now automated in `install.sh`.
 
 ### Billing / routing issues
 

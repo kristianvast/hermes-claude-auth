@@ -61,6 +61,27 @@ fi
 chmod 644 "$SITECUSTOMIZE"
 printf "${GREEN}[✓] Installed hook into %s${RESET}\n" "$SITECUSTOMIZE"
 
+# macOS: hermes-agent reads Claude subscription credentials from
+# ~/.claude/.credentials.json, but Claude Code on macOS stores them in
+# Keychain only.  Mirror the Keychain entry into the file so auth works
+# out of the box.  No-op on Linux (Claude Code writes the file directly).
+if [ "$(uname -s)" = "Darwin" ]; then
+    CRED_FILE="$HOME/.claude/.credentials.json"
+    if KEYCHAIN_CRED="$(security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null)"; then
+        mkdir -p "$(dirname "$CRED_FILE")"
+        if [ ! -f "$CRED_FILE" ] || [ "$(cat "$CRED_FILE" 2>/dev/null)" != "$KEYCHAIN_CRED" ]; then
+            printf '%s' "$KEYCHAIN_CRED" > "$CRED_FILE"
+            chmod 600 "$CRED_FILE"
+            printf "${GREEN}[✓] Mirrored Claude Code credentials from Keychain → %s${RESET}\n" "$CRED_FILE"
+        else
+            printf "${GREEN}[✓] Claude Code credentials file already matches Keychain${RESET}\n"
+        fi
+    elif [ ! -f "$CRED_FILE" ]; then
+        printf "${YELLOW}[!] macOS detected but no 'Claude Code-credentials' Keychain entry found${RESET}\n"
+        printf "    Run: claude auth login --claudeai\n"
+    fi
+fi
+
 if systemctl --user is-active hermes-gateway.service >/dev/null 2>&1; then
     systemctl --user restart hermes-gateway.service
     printf "${GREEN}[✓] Restarted hermes-gateway.service${RESET}\n"

@@ -139,6 +139,92 @@ else
     fail "$T5" "install.sh or uninstall.sh --purge exited non-zero"
 fi
 
+# macOS Keychain mirror tests — fake `uname -s` → Darwin and a fake
+# `security find-generic-password` via PATH shims so install.sh takes the
+# Darwin branch without an actual Mac.
+FAKE_BIN="$FAKE_HOME/fakebin"
+mkdir -p "$FAKE_BIN"
+cat > "$FAKE_BIN/uname" <<'UNAME_EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-s" ]; then
+    echo Darwin
+    exit 0
+fi
+exec /usr/bin/uname "$@"
+UNAME_EOF
+chmod +x "$FAKE_BIN/uname"
+
+FAKE_CRED='{"oauth":{"accessToken":"sk-ant-fake","refreshToken":"rt-fake","expiresAt":0}}'
+cat > "$FAKE_BIN/security" <<SECURITY_EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = "find-generic-password" ] && [ "\${2:-}" = "-s" ] \\
+    && [ "\${3:-}" = "Claude Code-credentials" ] && [ "\${4:-}" = "-w" ]; then
+    printf '%s' '$FAKE_CRED'
+    exit 0
+fi
+exit 1
+SECURITY_EOF
+chmod +x "$FAKE_BIN/security"
+
+# Test 6: Fresh macOS install mirrors Keychain → ~/.claude/.credentials.json
+T6="Test 6: macOS install mirrors Keychain credentials to credentials.json"
+rm -rf "$FAKE_HOME/.claude"
+if PATH="$FAKE_BIN:$PATH" "$REPO_DIR/install.sh" >/dev/null 2>&1; then
+    ok=1
+    CRED_FILE="$FAKE_HOME/.claude/.credentials.json"
+    assert_file_exists "$T6" "$CRED_FILE" || ok=0
+    if [ -f "$CRED_FILE" ]; then
+        actual="$(cat "$CRED_FILE")"
+        if [ "$actual" != "$FAKE_CRED" ]; then
+            fail "$T6" "credentials content mismatch: got '$actual'"
+            ok=0
+        fi
+        mode="$(python3 -c "import os, sys; print(oct(os.stat(sys.argv[1]).st_mode)[-3:])" "$CRED_FILE")"
+        if [ "$mode" != "600" ]; then
+            fail "$T6" "credentials file mode is $mode, expected 600"
+            ok=0
+        fi
+    fi
+    [ "$ok" -eq 1 ] && pass "$T6"
+else
+    fail "$T6" "install.sh exited non-zero under faked macOS"
+fi
+
+# Test 7: Idempotent macOS re-install does not rewrite file with identical content
+T7="Test 7: macOS re-install does not rewrite identical credentials"
+CRED_FILE="$FAKE_HOME/.claude/.credentials.json"
+if [ -f "$CRED_FILE" ]; then
+    mtime_before="$(python3 -c "import os, sys; print(os.stat(sys.argv[1]).st_mtime_ns)" "$CRED_FILE")"
+    sleep 1
+    if PATH="$FAKE_BIN:$PATH" "$REPO_DIR/install.sh" >/dev/null 2>&1; then
+        mtime_after="$(python3 -c "import os, sys; print(os.stat(sys.argv[1]).st_mtime_ns)" "$CRED_FILE")"
+        if [ "$mtime_before" != "$mtime_after" ]; then
+            fail "$T7" "credentials file rewritten despite identical content"
+        else
+            pass "$T7"
+        fi
+    else
+        fail "$T7" "install.sh exited non-zero on idempotent macOS re-run"
+    fi
+else
+    fail "$T7" "Test 6 did not produce a credentials file; cannot run idempotency check"
+fi
+
+# Test 8: macOS install with no Keychain entry leaves credentials file absent
+T8="Test 8: macOS install with missing Keychain entry leaves no file"
+rm -rf "$FAKE_HOME/.claude"
+cat > "$FAKE_BIN/security" <<'SECURITY_FAIL_EOF'
+#!/usr/bin/env bash
+exit 1
+SECURITY_FAIL_EOF
+chmod +x "$FAKE_BIN/security"
+
+if PATH="$FAKE_BIN:$PATH" "$REPO_DIR/install.sh" >/dev/null 2>&1; then
+    assert_file_not_exists "$T8" "$FAKE_HOME/.claude/.credentials.json" && pass "$T8"
+else
+    fail "$T8" "install.sh exited non-zero when Keychain entry absent"
+fi
+
 TOTAL=$((PASS + FAIL))
 printf '\n%d/%d tests passed\n' "$PASS" "$TOTAL"
 [ "$FAIL" -eq 0 ]

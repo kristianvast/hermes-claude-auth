@@ -87,11 +87,16 @@ Version history
   header, ``?beta=true`` query param on ``/v1/messages``.  Addresses the
   "Third-party apps now draw from your extra usage, not your plan limits"
   400 error introduced by Anthropic's 2026-04-14+ validator tightening.
+- 1.1.1 (2026-04-22): Installer only — ``install.sh`` now auto-mirrors the
+  ``Claude Code-credentials`` macOS Keychain entry into
+  ``~/.claude/.credentials.json`` on Darwin hosts, so the oneliner works
+  end-to-end on macOS without a manual post-install step.  Bypass module
+  itself is unchanged; version bump tracks the release.
 """
 
 from __future__ import annotations
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 import hashlib
 import inspect

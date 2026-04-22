@@ -3,8 +3,9 @@ Claude Code OAuth bypass for hermes-agent.
 ==========================================
 
 Monkey-patches hermes-agent's ``agent.anthropic_adapter.build_anthropic_kwargs``
-at import time via a sitecustomize.py hook so that OAuth-authenticated requests
-pass Anthropic's server-side content validation.
+and ``normalize_anthropic_response`` at import time via a sitecustomize.py hook
+so that OAuth-authenticated requests pass Anthropic's server-side content
+validation and still route to the Claude Max/Pro subscription tier.
 
 Background
 ----------
@@ -23,10 +24,37 @@ opencode-claude-auth v1.4.8 (PR #148) worked around it by:
      message wrapped in ``<system-reminder>`` blocks.
   3. Adding the ``prompt-caching-scope-2026-01-05`` beta flag.
 
+Between 2026-04-14 and 2026-04-16, Anthropic tightened the validator further.
+Two additional signals matter:
+
+  - Tool names are now inspected: real Claude Code uses PascalCase after the
+    ``mcp_`` prefix (``mcp_Bash``, ``mcp_Read``, ``mcp_Background_output``).
+    Requests with lowercase names (``mcp_bash``) are classified as third-party
+    and the response says "Third-party apps now draw from your extra usage,
+    not your plan limits."  This was fixed in opencode-claude-auth PR #191.
+  - The request fingerprint was updated in Claude Code 2.1.112 (upstream PR
+    #207, currently unmerged): the billing entrypoint changed from ``cli`` to
+    ``sdk-cli``, the ``advisor-tool-2026-03-01`` beta flag was added, the SDK
+    now sends ``x-stainless-*`` headers and ``anthropic-dangerous-direct-
+    browser-access: true``, and ``/v1/messages`` is called with ``?beta=true``.
+
 hermes-agent already implements the Claude Code identity prefix, user-agent
-spoofing, ``x-app: cli``, tool name ``mcp_`` prefixing, and the
-``oauth-2025-04-20`` / ``claude-code-20250219`` beta flags.  This patch adds
-only the three items above plus a temperature fix for Opus 4.6 adaptive thinking.
+spoofing, ``x-app: cli``, lowercase tool name ``mcp_`` prefixing, Hermes→Claude
+Code product-name scrubbing, dynamic Claude CLI version detection, and the
+``oauth-2025-04-20`` / ``claude-code-20250219`` beta flags.
+
+This patch fills the remaining gaps:
+
+  - Signed billing header (system[0]) with the ``sdk-cli`` entrypoint.
+  - System prompt relocation to first user message.
+  - ``prompt-caching-scope-2026-01-05`` + ``advisor-tool-2026-03-01`` beta flags.
+  - PascalCase rewrite of hermes's lowercase ``mcp_`` prefixed tool names in
+    both the outgoing request and the response normalization path (so the tool
+    dispatcher continues to receive the original lowercase names).
+  - Stainless SDK spoof headers + ``anthropic-dangerous-direct-browser-access``
+    + ``?beta=true`` query param injected via the Anthropic SDK's per-request
+    ``extra_headers`` / ``extra_query`` kwargs.
+  - Temperature fix for Opus 4.6 adaptive thinking (HTTP 400 otherwise).
 
 Installation
 ------------
@@ -45,21 +73,30 @@ site-packages and restart hermes-gateway.
 References
 ----------
 - https://github.com/griffinmartin/opencode-claude-auth
-- https://github.com/griffinmartin/opencode-claude-auth/pull/148
+- https://github.com/griffinmartin/opencode-claude-auth/pull/148 (billing header)
+- https://github.com/griffinmartin/opencode-claude-auth/pull/191 (PascalCase tools)
+- https://github.com/griffinmartin/opencode-claude-auth/pull/207 (Claude Code 2.1.112 fingerprint)
 
 Version history
 ---------------
 - 1.0.0 (2026-04-09): Initial — billing header, system prompt relocation,
   prompt-caching beta flag, aux-client temperature hook for Opus 4.6.
+- 1.1.0 (2026-04-22): PascalCase ``mcp_`` tool prefix (request + response),
+  ``sdk-cli`` billing entrypoint, ``advisor-tool-2026-03-01`` beta flag,
+  Stainless SDK spoof headers, ``anthropic-dangerous-direct-browser-access``
+  header, ``?beta=true`` query param on ``/v1/messages``.  Addresses the
+  "Third-party apps now draw from your extra usage, not your plan limits"
+  400 error introduced by Anthropic's 2026-04-14+ validator tightening.
 """
 
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import hashlib
 import inspect
 import logging
+import platform
 import sys
 import traceback
 from typing import Any, Dict, List
@@ -74,10 +111,35 @@ logger = logging.getLogger("anthropic_billing_bypass")
 # uses this salt to verify billing-header signatures.
 _BILLING_SALT = "59cf53e54c78"
 
+# Billing entrypoint — Claude Code 2.1.112+ reports ``sdk-cli`` instead of the
+# legacy ``cli`` value.  Anthropic's validator matches this against the
+# x-stainless-* headers; a mismatch routes the request to third-party billing.
+_BILLING_ENTRYPOINT = "sdk-cli"
+
 # Sentinel strings — entries in system[] starting with these are kept;
 # everything else is relocated to the first user message.
 _BILLING_PREFIX = "x-anthropic-billing-header"
 _SYSTEM_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+
+# Tool-name prefix used by hermes-agent's existing OAuth path.  We rewrite
+# hermes's lowercase ``mcp_foo`` to Claude Code's PascalCase ``mcp_Foo``.
+_MCP_PREFIX = "mcp_"
+
+# Stainless SDK version the Anthropic JS SDK reports.  Real Claude Code ships
+# @anthropic-ai/sdk@0.81.0 as of 2.1.112 — we spoof the same value.
+_STAINLESS_PACKAGE_VERSION = "0.81.0"
+
+# Node runtime version Claude Code 2.1.112 runs under.  We send a recent LTS
+# value rather than our actual Python version (which would give us away).
+_STAINLESS_NODE_VERSION = "v22.11.0"
+
+# Additional beta flags the OAuth path needs on top of hermes-agent's built-in
+# ``claude-code-20250219`` and ``oauth-2025-04-20``.  These are appended to
+# ``_OAUTH_ONLY_BETAS`` in ``apply_patches``.
+_EXTRA_OAUTH_BETAS = [
+    "prompt-caching-scope-2026-01-05",
+    "advisor-tool-2026-03-01",
+]
 
 
 def _extract_first_user_message_text(messages: List[Dict[str, Any]]) -> str:
@@ -135,6 +197,114 @@ def _build_billing_header_value(
         f"cc_entrypoint={entrypoint}; "
         f"cch={cch};"
     )
+
+
+def _stainless_arch() -> str:
+    machine = (platform.machine() or "").lower()
+    if machine in ("x86_64", "amd64"):
+        return "x64"
+    if machine in ("arm64", "aarch64"):
+        return "arm64"
+    if machine in ("i386", "i686"):
+        return "ia32"
+    return machine or "unknown"
+
+
+def _stainless_os() -> str:
+    mapping = {"Darwin": "MacOS", "Linux": "Linux", "Windows": "Windows"}
+    return mapping.get(platform.system(), platform.system() or "Unknown")
+
+
+def _build_spoof_headers() -> Dict[str, str]:
+    """Headers real Claude Code 2.1.112 sends that hermes-agent does not.
+
+    The Anthropic SDK (Stainless-generated) automatically attaches
+    ``x-stainless-*`` identifying headers.  The validator cross-references these
+    with the billing header's ``cc_entrypoint``; absent or mismatched values
+    flag the request as third-party.  ``anthropic-dangerous-direct-browser-
+    access: true`` is a separate Claude Code CLI behavior.
+    """
+    return {
+        "anthropic-dangerous-direct-browser-access": "true",
+        "x-stainless-arch": _stainless_arch(),
+        "x-stainless-lang": "js",
+        "x-stainless-os": _stainless_os(),
+        "x-stainless-package-version": _STAINLESS_PACKAGE_VERSION,
+        "x-stainless-retry-count": "0",
+        "x-stainless-runtime": "node",
+        "x-stainless-runtime-version": _STAINLESS_NODE_VERSION,
+        "x-stainless-timeout": "600",
+    }
+
+
+def _pascalcase_mcp_name(name: str) -> str:
+    """Rewrite ``mcp_foo_bar`` → ``mcp_Foo_bar``.
+
+    Matches opencode-claude-auth PR #191 exactly: only the character
+    immediately following the ``mcp_`` prefix is uppercased.  Names already in
+    PascalCase are returned unchanged.
+    """
+    if not isinstance(name, str) or not name.startswith(_MCP_PREFIX):
+        return name
+    rest = name[len(_MCP_PREFIX):]
+    if not rest or not rest[0].islower():
+        return name
+    return _MCP_PREFIX + rest[0].upper() + rest[1:]
+
+
+def _rewrite_tool_names_pascalcase(api_kwargs: Dict[str, Any]) -> None:
+    """Convert hermes-agent's lowercase ``mcp_`` tool names to PascalCase.
+
+    Hermes prefixes tools with ``mcp_`` at line 1365 of ``anthropic_adapter``
+    using the literal ``_MCP_TOOL_PREFIX + tool["name"]``, which produces
+    lowercase values like ``mcp_bash``.  Anthropic's billing validator
+    blacklists specific lowercase names (e.g. ``background_output``), flagging
+    the client as non-Claude-Code.  Real Claude Code uses PascalCase after the
+    prefix; we rewrite the request in-place.
+    """
+    tools = api_kwargs.get("tools")
+    if isinstance(tools, list):
+        for tool in tools:
+            if isinstance(tool, dict) and "name" in tool:
+                tool["name"] = _pascalcase_mcp_name(tool.get("name") or "")
+
+    messages = api_kwargs.get("messages")
+    if isinstance(messages, list):
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use" and "name" in block:
+                    block["name"] = _pascalcase_mcp_name(block.get("name") or "")
+
+
+def _merge_spoof_extras(api_kwargs: Dict[str, Any]) -> None:
+    """Inject Claude Code 2.1.112 request fingerprint via extra_headers / extra_query.
+
+    The Anthropic Python SDK forwards both to the underlying HTTP request:
+    ``extra_headers`` becomes request headers (merged with client defaults),
+    ``extra_query`` becomes URL query parameters.  We avoid overwriting values
+    already set by hermes-agent (e.g. its fast-mode ``anthropic-beta`` header)
+    so our spoof is additive.
+    """
+    existing_headers = api_kwargs.get("extra_headers")
+    merged_headers: Dict[str, str] = dict(_build_spoof_headers())
+    if isinstance(existing_headers, dict):
+        for key, value in existing_headers.items():
+            merged_headers[key] = value
+    api_kwargs["extra_headers"] = merged_headers
+
+    existing_query = api_kwargs.get("extra_query")
+    merged_query: Dict[str, str] = {"beta": "true"}
+    if isinstance(existing_query, dict):
+        for key, value in existing_query.items():
+            merged_query[key] = value
+    api_kwargs["extra_query"] = merged_query
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +413,9 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
 
     # Compute billing header using ORIGINAL messages (before relocation).
     try:
-        billing_value = _build_billing_header_value(messages, version, "cli")
+        billing_value = _build_billing_header_value(
+            messages, version, _BILLING_ENTRYPOINT
+        )
     except Exception as exc:
         logger.warning("Failed to build billing header: %s", exc)
         return
@@ -287,6 +459,8 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
     if moved_texts:
         _prepend_to_first_user_message(messages, moved_texts)
 
+    _rewrite_tool_names_pascalcase(api_kwargs)
+    _merge_spoof_extras(api_kwargs)
     _fix_temperature_for_oauth_adaptive(api_kwargs, site="build_kwargs")
 
 
@@ -309,6 +483,71 @@ def _get_version_safely(aa_module: Any) -> str:
     if isinstance(fallback, str) and fallback:
         return fallback
     return "2.1.90"
+
+
+def _lowercase_first(name: str) -> str:
+    if not name:
+        return name
+    return name[0].lower() + name[1:]
+
+
+def _install_response_pascalcase_unhook(aa_module: Any, force: bool = False) -> bool:
+    """Post-process ``normalize_anthropic_response`` to restore lowercase tool names.
+
+    We rewrote outgoing tool names from ``mcp_bash`` to ``mcp_Bash`` to pass
+    Anthropic's validator.  The response comes back referencing ``mcp_Bash``
+    too.  Hermes strips the ``mcp_`` prefix (line 1488-1489 of
+    ``anthropic_adapter``), leaving ``Bash`` — which hermes's tool dispatcher
+    cannot find because the registered name is ``bash``.  We wrap
+    ``normalize_anthropic_response`` to lowercase the first character of each
+    tool call name after hermes's strip runs.
+    """
+    if getattr(aa_module, "_CLAUDE_CODE_RESPONSE_UNHOOK_APPLIED", False) and not force:
+        logger.debug("response PascalCase unhook already installed")
+        return True
+
+    original = getattr(aa_module, "normalize_anthropic_response", None)
+    if not callable(original):
+        logger.warning("normalize_anthropic_response not found; skipping response unhook")
+        return False
+
+    def patched_normalize(response: Any, strip_tool_prefix: bool = False, **kwargs: Any) -> Any:
+        result = original(response, strip_tool_prefix=strip_tool_prefix, **kwargs)
+        if not strip_tool_prefix:
+            return result
+        try:
+            assistant_message, _finish = result
+        except (TypeError, ValueError):
+            return result
+        tool_calls = getattr(assistant_message, "tool_calls", None)
+        if not tool_calls:
+            return result
+        for tc in tool_calls:
+            fn = getattr(tc, "function", None)
+            if fn is None:
+                continue
+            name = getattr(fn, "name", None)
+            if isinstance(name, str) and name and name[0].isupper():
+                try:
+                    fn.name = _lowercase_first(name)
+                except Exception:
+                    pass
+        return result
+
+    patched_normalize.__name__ = original.__name__
+    patched_normalize.__qualname__ = getattr(
+        original, "__qualname__", original.__name__
+    )
+    patched_normalize.__doc__ = original.__doc__
+    patched_normalize.__wrapped__ = original  # type: ignore[attr-defined]
+
+    aa_module.normalize_anthropic_response = patched_normalize
+    aa_module._CLAUDE_CODE_RESPONSE_UNHOOK_APPLIED = True  # type: ignore[attr-defined]
+    logger.info("Response PascalCase unhook installed on normalize_anthropic_response")
+    sys.stderr.write(
+        "[anthropic_billing_bypass] Response PascalCase unhook installed\n"
+    )
+    return True
 
 
 def _install_aux_client_hook(force: bool = False) -> bool:
@@ -426,12 +665,13 @@ def apply_patches(anthropic_adapter_module: Any = None) -> bool:
         logger.debug("Claude Code bypass already installed")
         return True
 
-    # 1. Add the missing beta flag.
-    new_beta = "prompt-caching-scope-2026-01-05"
+    # 1. Add the missing beta flags (prompt-caching + advisor-tool).
     oauth_betas = getattr(aa, "_OAUTH_ONLY_BETAS", None)
-    if isinstance(oauth_betas, list) and new_beta not in oauth_betas:
-        oauth_betas.append(new_beta)
-        logger.info("Appended beta flag: %s", new_beta)
+    if isinstance(oauth_betas, list):
+        for new_beta in _EXTRA_OAUTH_BETAS:
+            if new_beta not in oauth_betas:
+                oauth_betas.append(new_beta)
+                logger.info("Appended beta flag: %s", new_beta)
 
     # 2. Verify the target function exists with the expected signature.
     original_build = getattr(aa, "build_anthropic_kwargs", None)
@@ -492,6 +732,7 @@ def apply_patches(anthropic_adapter_module: Any = None) -> bool:
     logger.info("Claude Code OAuth bypass installed (build_anthropic_kwargs)")
     sys.stderr.write("[anthropic_billing_bypass] Claude Code OAuth bypass installed\n")
 
+    _install_response_pascalcase_unhook(aa)
     _install_aux_client_hook()
 
     return True

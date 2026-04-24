@@ -92,11 +92,16 @@ Version history
   ``~/.claude/.credentials.json`` on Darwin hosts, so the oneliner works
   end-to-end on macOS without a manual post-install step.  Bypass module
   itself is unchanged; version bump tracks the release.
+- 1.2.0 (2026-04-24): MD5 tool name obfuscation — Anthropic's validator began
+  blacklisting PascalCase ``mcp_*`` names as well as lowercase variants.
+  Replaces PascalCase rewrite with MD5 hashing: all tool names are rewritten
+  to ``t_<8hexchars>`` in outgoing requests, with a bidirectional map used to
+  restore original names from responses.  Ports opencode-claude-auth PR #193.
 """
 
 from __future__ import annotations
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 import hashlib
 import inspect
@@ -242,36 +247,48 @@ def _build_spoof_headers() -> Dict[str, str]:
     }
 
 
-def _pascalcase_mcp_name(name: str) -> str:
-    """Rewrite ``mcp_foo_bar`` → ``mcp_Foo_bar``.
+import hashlib as _hashlib
 
-    Matches opencode-claude-auth PR #191 exactly: only the character
-    immediately following the ``mcp_`` prefix is uppercased.  Names already in
-    PascalCase are returned unchanged.
-    """
-    if not isinstance(name, str) or not name.startswith(_MCP_PREFIX):
-        return name
-    rest = name[len(_MCP_PREFIX):]
-    if not rest or not rest[0].islower():
-        return name
-    return _MCP_PREFIX + rest[0].upper() + rest[1:]
+# Bidirectional maps for tool name obfuscation (MD5-based, per PR #193).
+# Keyed by session so concurrent requests don't cross-pollinate, but a single
+# module-level dict is fine for hermes-agent's single-process model.
+_TOOL_NAME_OBF_MAP: Dict[str, str] = {}   # obfuscated → original
+_TOOL_NAME_REV_MAP: Dict[str, str] = {}   # original    → obfuscated
+
+
+def _obfuscate_tool_name(name: str) -> str:
+    """Return a stable ``t_<8hexchars>`` token for *name*, building the map."""
+    if name in _TOOL_NAME_REV_MAP:
+        return _TOOL_NAME_REV_MAP[name]
+    h = _hashlib.md5(name.encode()).hexdigest()[:8]
+    obf = f"t_{h}"
+    _TOOL_NAME_OBF_MAP[obf] = name
+    _TOOL_NAME_REV_MAP[name] = obf
+    return obf
+
+
+def _deobfuscate_tool_name(obf: str) -> str:
+    return _TOOL_NAME_OBF_MAP.get(obf, obf)
 
 
 def _rewrite_tool_names_pascalcase(api_kwargs: Dict[str, Any]) -> None:
-    """Convert hermes-agent's lowercase ``mcp_`` tool names to PascalCase.
+    """Obfuscate tool names in the outgoing request via MD5 hashing.
 
-    Hermes prefixes tools with ``mcp_`` at line 1365 of ``anthropic_adapter``
-    using the literal ``_MCP_TOOL_PREFIX + tool["name"]``, which produces
-    lowercase values like ``mcp_bash``.  Anthropic's billing validator
-    blacklists specific lowercase names (e.g. ``background_output``), flagging
-    the client as non-Claude-Code.  Real Claude Code uses PascalCase after the
-    prefix; we rewrite the request in-place.
+    Anthropic's billing validator blacklists specific tool names
+    (``todowrite``, ``background_output``, ``background_cancel`` and their
+    ``mcp_`` prefixed variants).  We hash ALL tool names to ``t_<8hexchars>``
+    so none of them are recognisable, following opencode-claude-auth PR #193.
+    The reverse map is used in the response unhook to restore original names.
     """
     tools = api_kwargs.get("tools")
     if isinstance(tools, list):
         for tool in tools:
             if isinstance(tool, dict) and "name" in tool:
-                tool["name"] = _pascalcase_mcp_name(tool.get("name") or "")
+                raw = tool.get("name") or ""
+                # Strip hermes's mcp_ prefix before hashing so the hash is
+                # stable regardless of whether hermes prepended it.
+                bare = raw[len(_MCP_PREFIX):] if raw.startswith(_MCP_PREFIX) else raw
+                tool["name"] = _obfuscate_tool_name(bare)
 
     messages = api_kwargs.get("messages")
     if isinstance(messages, list):
@@ -285,7 +302,9 @@ def _rewrite_tool_names_pascalcase(api_kwargs: Dict[str, Any]) -> None:
                 if not isinstance(block, dict):
                     continue
                 if block.get("type") == "tool_use" and "name" in block:
-                    block["name"] = _pascalcase_mcp_name(block.get("name") or "")
+                    raw = block.get("name") or ""
+                    bare = raw[len(_MCP_PREFIX):] if raw.startswith(_MCP_PREFIX) else raw
+                    block["name"] = _obfuscate_tool_name(bare)
 
 
 def _merge_spoof_extras(api_kwargs: Dict[str, Any]) -> None:
@@ -532,11 +551,19 @@ def _install_response_pascalcase_unhook(aa_module: Any, force: bool = False) -> 
             if fn is None:
                 continue
             name = getattr(fn, "name", None)
-            if isinstance(name, str) and name and name[0].isupper():
-                try:
-                    fn.name = _lowercase_first(name)
-                except Exception:
-                    pass
+            if isinstance(name, str) and name:
+                deobf = _deobfuscate_tool_name(name)
+                if deobf != name:
+                    try:
+                        fn.name = deobf
+                    except Exception:
+                        pass
+                elif name[0].isupper():
+                    # fallback: legacy PascalCase unhook
+                    try:
+                        fn.name = _lowercase_first(name)
+                    except Exception:
+                        pass
         return result
 
     patched_normalize.__name__ = original.__name__

@@ -32,8 +32,13 @@ def _wrap_tool_name_as_mcp_hermes(name: str) -> str:
     return _MCP_HERMES_NAMESPACE + name
 
 def _unwrap_mcp_hermes_name(name: Any) -> Any:
-    if isinstance(name, str) and name.startswith(_MCP_HERMES_NAMESPACE):
-        return name[len(_MCP_HERMES_NAMESPACE) :]
+    if not isinstance(name, str): return name
+    if name.startswith(_MCP_HERMES_NAMESPACE):
+        return name[len(_MCP_HERMES_NAMESPACE):]
+    # Handle case where mcp_ was already stripped by native Hermes code
+    hermes_stripped_prefix = _MCP_HERMES_NAMESPACE[len(_MCP_PREFIX):] # "_hermes__"
+    if name.startswith(hermes_stripped_prefix):
+        return name[len(hermes_stripped_prefix):]
     return name
 
 def _normalize_tool_name(name: str) -> str:

@@ -497,7 +497,7 @@ def _lowercase_first(name: str) -> str:
 
 
 def _install_response_pascalcase_unhook(aa_module: Any, force: bool = False) -> bool:
-    """Post-process ``normalize_anthropic_response`` to restore lowercase tool names.
+    """Post-process response normalization to restore lowercase tool names.
 
     We rewrote outgoing tool names from ``mcp_bash`` to ``mcp_Bash`` to pass
     Anthropic's validator.  The response comes back referencing ``mcp_Bash``
@@ -513,6 +513,35 @@ def _install_response_pascalcase_unhook(aa_module: Any, force: bool = False) -> 
 
     original = getattr(aa_module, "normalize_anthropic_response", None)
     if not callable(original):
+        # Try to find AnthropicTransport in agent.transports.anthropic
+        try:
+            from agent.transports import anthropic as at
+            original_class = getattr(at, "AnthropicTransport", None)
+            if original_class:
+                original = getattr(original_class, "normalize_response", None)
+                if callable(original):
+                    def patched_normalize_transport(self, response: Any, **kwargs: Any) -> Any:
+                        result = original(self, response, **kwargs)
+                        tool_calls = getattr(result, "tool_calls", None)
+                        if not tool_calls:
+                            return result
+                        for tc in tool_calls:
+                            name = getattr(tc, "name", None)
+                            if isinstance(name, str) and name and name[0].isupper():
+                                try:
+                                    tc.name = _lowercase_first(name)
+                                except Exception:
+                                    pass
+                        return result
+                    
+                    original_class.normalize_response = patched_normalize_transport
+                    aa_module._CLAUDE_CODE_RESPONSE_UNHOOK_APPLIED = True
+                    logger.info("Response PascalCase unhook installed on AnthropicTransport.normalize_response")
+                    sys.stderr.write("[anthropic_billing_bypass] Response PascalCase unhook installed (Transport)\n")
+                    return True
+        except ImportError:
+            pass
+
         logger.warning("normalize_anthropic_response not found; skipping response unhook")
         return False
 

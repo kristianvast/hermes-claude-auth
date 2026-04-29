@@ -29,12 +29,13 @@ else
 fi
 
 VENV_PYTHON="$VENV_DIR/bin/python"
+if [ ! -x "$VENV_PYTHON" ]; then VENV_PYTHON="$VENV_DIR/bin/python3"; fi
 if [ ! -x "$VENV_PYTHON" ]; then
     printf "${RED}[✗] Python not found at %s${RESET}\n" "$VENV_PYTHON"
     exit 1
 fi
 
-SITE_PACKAGES="$("$VENV_PYTHON" -c "import site; print(site.getsitepackages()[0])")"
+SITE_PACKAGES="$("$VENV_PYTHON" -c "import site; print(site.getsitepackages()[0] if site.getsitepackages() else site.getusersitepackages())")"
 if [ ! -d "$SITE_PACKAGES" ]; then
     printf "${RED}[✗] site-packages directory does not exist: %s${RESET}\n" "$SITE_PACKAGES"
     exit 1

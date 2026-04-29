@@ -5,10 +5,13 @@ from types import SimpleNamespace
 
 from anthropic_billing_bypass import (
     _BILLING_ENTRYPOINT,
+    _MCP_HERMES_NAMESPACE,
     _SYSTEM_IDENTITY,
     _fix_temperature_for_oauth_adaptive,
     _install_response_pascalcase_unhook,
     _pascalcase_mcp_name,
+    _unwrap_mcp_hermes_name,
+    _wrap_tool_name_as_mcp_hermes,
     apply_claude_code_bypass,
 )
 
@@ -149,20 +152,103 @@ def test_apply_claude_code_bypass_rewrites_tool_names_to_pascalcase(basic_api_kw
     assert tool_use_block["name"] == "mcp_Bash"
 
 
+def test_wrap_tool_name_as_mcp_hermes_wraps_flat_lowercase():
+    assert _wrap_tool_name_as_mcp_hermes("browser_back") == "mcp__hermes__browser_back"
+    assert _wrap_tool_name_as_mcp_hermes("vision_analyze") == "mcp__hermes__vision_analyze"
+
+
+def test_wrap_tool_name_as_mcp_hermes_leaves_mcp_prefixed_alone():
+    # Already in legacy single-underscore mcp_ shape — skip.
+    assert _wrap_tool_name_as_mcp_hermes("mcp_bash") == "mcp_bash"
+    assert _wrap_tool_name_as_mcp_hermes("mcp_Bash") == "mcp_Bash"
+    # Already in modern mcp__server__tool shape — skip.
+    assert (
+        _wrap_tool_name_as_mcp_hermes("mcp__claude_ai__notion_search")
+        == "mcp__claude_ai__notion_search"
+    )
+
+
+def test_wrap_tool_name_as_mcp_hermes_handles_empty_and_non_strings():
+    assert _wrap_tool_name_as_mcp_hermes("") == ""
+    assert _wrap_tool_name_as_mcp_hermes(None) is None  # type: ignore[arg-type]
+
+
+def test_unwrap_mcp_hermes_name_strips_namespace_prefix():
+    assert _unwrap_mcp_hermes_name("mcp__hermes__browser_back") == "browser_back"
+    assert _unwrap_mcp_hermes_name("mcp__hermes__terminal") == "terminal"
+
+
+def test_unwrap_mcp_hermes_name_passes_unrelated_names_through():
+    assert _unwrap_mcp_hermes_name("Bash") == "Bash"
+    assert _unwrap_mcp_hermes_name("mcp__claude_ai__foo") == "mcp__claude_ai__foo"
+    assert _unwrap_mcp_hermes_name(None) is None
+
+
+def test_apply_claude_code_bypass_wraps_flat_tool_names_with_mcp_hermes_namespace(
+    basic_api_kwargs,
+):
+    basic_api_kwargs["tools"] = [
+        {"name": "browser_back"},
+        {"name": "vision_analyze"},
+        {"name": "mcp_bash"},  # legacy mcp_ — gets PascalCase, NOT wrapped
+        {"name": "mcp__claude_ai__foo"},  # modern MCP — left alone
+    ]
+    basic_api_kwargs["messages"] = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hello"},
+                {
+                    "type": "tool_use",
+                    "name": "browser_back",
+                    "id": "tool_1",
+                    "input": {},
+                },
+            ],
+        }
+    ]
+
+    apply_claude_code_bypass(basic_api_kwargs, "2.1.123")
+
+    names = [t["name"] for t in basic_api_kwargs["tools"]]
+    assert names == [
+        "mcp__hermes__browser_back",
+        "mcp__hermes__vision_analyze",
+        "mcp_Bash",
+        "mcp__claude_ai__foo",
+    ]
+    tool_use = basic_api_kwargs["messages"][0]["content"][-1]
+    assert tool_use["name"] == "mcp__hermes__browser_back"
+
+
+def test_mcp_hermes_namespace_constant_uses_double_underscore():
+    # Real CC's MCP tools use double-underscore separators
+    # (mcp__SERVER__TOOL).  Single-underscore would not match the validator's
+    # pattern check.
+    assert _MCP_HERMES_NAMESPACE == "mcp__hermes__"
+    assert _MCP_HERMES_NAMESPACE.count("__") == 2  # leading mcp__ + trailing __
+
+
 def test_apply_claude_code_bypass_injects_stainless_and_direct_browser_headers(
     basic_api_kwargs,
 ):
-    apply_claude_code_bypass(basic_api_kwargs, "2.1.112")
+    apply_claude_code_bypass(basic_api_kwargs, "2.1.123")
 
     extra_headers = basic_api_kwargs["extra_headers"]
+    # Application-specific headers — lowercase, no SDK collision.
     assert extra_headers["anthropic-dangerous-direct-browser-access"] == "true"
-    assert extra_headers["x-stainless-lang"] == "js"
-    assert extra_headers["x-stainless-runtime"] == "node"
-    assert extra_headers["x-stainless-package-version"] == "0.81.0"
+    assert extra_headers["x-claude-code-session-id"]
     assert extra_headers["x-stainless-retry-count"] == "0"
     assert extra_headers["x-stainless-timeout"] == "600"
-    assert extra_headers["x-stainless-os"] in ("MacOS", "Linux", "Windows")
-    assert extra_headers["x-stainless-arch"] in ("x64", "arm64", "ia32", "unknown")
+    # SDK overrides — keys MUST be CapitalCase to replace SDK defaults rather
+    # than coexist as duplicates (the bug v1.3 fixed).
+    assert extra_headers["X-Stainless-Lang"] == "js"
+    assert extra_headers["X-Stainless-Runtime"] == "node"
+    assert extra_headers["X-Stainless-Runtime-Version"] == "v24.3.0"
+    assert extra_headers["X-Stainless-Package-Version"] == "0.81.0"
+    assert extra_headers["X-Stainless-OS"] in ("MacOS", "Linux", "Windows")
+    assert extra_headers["X-Stainless-Arch"] in ("x64", "arm64", "ia32", "unknown")
+    assert extra_headers["User-Agent"] == "claude-cli/2.1.123 (external, sdk-cli)"
 
 
 def test_apply_claude_code_bypass_sets_beta_true_query_param(basic_api_kwargs):

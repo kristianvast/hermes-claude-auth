@@ -54,8 +54,8 @@ def _get_account_metadata() -> Dict[str, Any]:
     config = _read_claude_config()
     oauth = config.get("oauthAccount", {})
     metadata = {}
-    if "accountUuid" in oauth: metadata["account_uuid"] = oauth["accountUuid"]
-    if "organizationUuid" in oauth: metadata["organization_uuid"] = oauth["organizationUuid"]
+    if "accountUuid" in oauth:
+        metadata["user_id"] = oauth["accountUuid"]
     return metadata
 
 def _extract_first_user_message_text(messages: List[Dict[str, Any]]) -> str:

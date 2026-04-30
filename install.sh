@@ -45,21 +45,30 @@ cp "$SCRIPT_DIR/anthropic_billing_bypass.py" "$PATCHES_DIR/anthropic_billing_byp
 chmod 644 "$PATCHES_DIR/anthropic_billing_bypass.py"
 printf "${GREEN}[✓] Copied patch to %s/${RESET}\n" "$PATCHES_DIR"
 
-SITECUSTOMIZE="$SITE_PACKAGES/sitecustomize.py"
+cp "$SCRIPT_DIR/hermes_claude_auth_bootstrap.py" "$PATCHES_DIR/hermes_claude_auth_bootstrap.py"
+chmod 644 "$PATCHES_DIR/hermes_claude_auth_bootstrap.py"
+printf "${GREEN}[✓] Copied bootstrap hook to %s/${RESET}\n" "$PATCHES_DIR"
 
-if [ ! -f "$SITECUSTOMIZE" ]; then
-    cp "$SCRIPT_DIR/sitecustomize_hook.py" "$SITECUSTOMIZE"
-elif grep -q "$MARKER" "$SITECUSTOMIZE"; then
-    cp "$SCRIPT_DIR/sitecustomize_hook.py" "$SITECUSTOMIZE"
-else
-    BACKUP="$SITECUSTOMIZE.pre-hermes-claude-auth"
-    cp "$SITECUSTOMIZE" "$BACKUP"
-    printf "${YELLOW}[!] Backed up existing sitecustomize.py to %s${RESET}\n" "$BACKUP"
-    cp "$SCRIPT_DIR/sitecustomize_hook.py" "$SITECUSTOMIZE"
+PTH_FILE="$SITE_PACKAGES/hermes_claude_auth.pth"
+cat > "$PTH_FILE" <<EOF
+$MARKER — do not remove this marker
+$PATCHES_DIR
+import hermes_claude_auth_bootstrap
+EOF
+chmod 644 "$PTH_FILE"
+printf "${GREEN}[✓] Installed bootstrap loader at %s${RESET}\n" "$PTH_FILE"
+
+LEGACY_SITECUSTOMIZE="$SITE_PACKAGES/sitecustomize.py"
+LEGACY_BACKUP="$LEGACY_SITECUSTOMIZE.pre-hermes-claude-auth"
+if [ -f "$LEGACY_SITECUSTOMIZE" ] && grep -qF "$MARKER" "$LEGACY_SITECUSTOMIZE"; then
+    if [ -f "$LEGACY_BACKUP" ]; then
+        mv "$LEGACY_BACKUP" "$LEGACY_SITECUSTOMIZE"
+        printf "${GREEN}[✓] Restored original sitecustomize.py from %s${RESET}\n" "$LEGACY_BACKUP"
+    else
+        rm -f "$LEGACY_SITECUSTOMIZE"
+        printf "${GREEN}[✓] Removed legacy managed sitecustomize.py${RESET}\n"
+    fi
 fi
-
-chmod 644 "$SITECUSTOMIZE"
-printf "${GREEN}[✓] Installed hook into %s${RESET}\n" "$SITECUSTOMIZE"
 
 # macOS: hermes-agent reads Claude subscription credentials from
 # ~/.claude/.credentials.json, but Claude Code on macOS stores them in
@@ -91,5 +100,6 @@ fi
 
 printf "\n${GREEN}Installation complete.${RESET}\n"
 printf "  Patch:  %s/anthropic_billing_bypass.py\n" "$PATCHES_DIR"
-printf "  Hook:   %s\n" "$SITECUSTOMIZE"
+printf "  Boot:   %s/hermes_claude_auth_bootstrap.py\n" "$PATCHES_DIR"
+printf "  Loader: %s\n" "$PTH_FILE"
 printf "  Venv:   %s\n" "$VENV_DIR"

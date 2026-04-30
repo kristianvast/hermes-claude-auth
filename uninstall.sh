@@ -35,6 +35,8 @@ fi
 
 removed_hook=0
 restored_hook=0
+removed_loader=0
+removed_bootstrap=0
 removed_patch=0
 
 if [ -z "$VENV_DIR" ]; then
@@ -50,6 +52,13 @@ else
   if [ -z "$SITE_PACKAGES" ]; then
     printf '%b[—]%b Could not detect site-packages, skipping hook removal\n' "$YELLOW" "$RESET"
   else
+    PTH_FILE="$SITE_PACKAGES/hermes_claude_auth.pth"
+    if [ -e "$PTH_FILE" ] && grep -qF '# hermes-claude-auth managed' "$PTH_FILE"; then
+      rm -f "$PTH_FILE"
+      printf '%b[✓]%b Removed bootstrap loader %s\n' "$GREEN" "$RESET" "$PTH_FILE"
+      removed_loader=1
+    fi
+
     SITE_CUSTOMIZE="$SITE_PACKAGES/sitecustomize.py"
     BACKUP_FILE="$SITE_PACKAGES/sitecustomize.py.pre-hermes-claude-auth"
 
@@ -71,6 +80,15 @@ else
   fi
 fi
 
+BOOTSTRAP_FILE="$HOME/.hermes/patches/hermes_claude_auth_bootstrap.py"
+PATCH_PYCACHE_DIR="$HOME/.hermes/patches/__pycache__"
+if [ -e "$BOOTSTRAP_FILE" ]; then
+  rm -f "$BOOTSTRAP_FILE"
+  printf '%b[✓]%b Removed bootstrap hook from ~/.hermes/patches/\n' "$GREEN" "$RESET"
+  removed_bootstrap=1
+fi
+rm -f "$PATCH_PYCACHE_DIR"/hermes_claude_auth_bootstrap.*.pyc 2>/dev/null || true
+
 if [ "$PURGE" -eq 1 ]; then
   PATCH_DIR="$HOME/.hermes/patches"
   PATCH_FILE="$PATCH_DIR/anthropic_billing_bypass.py"
@@ -79,6 +97,10 @@ if [ "$PURGE" -eq 1 ]; then
     rm -f "$PATCH_FILE"
     printf '%b[✓]%b Removed patch from ~/.hermes/patches/\n' "$GREEN" "$RESET"
     removed_patch=1
+  fi
+  rm -f "$PATCH_PYCACHE_DIR"/anthropic_billing_bypass.*.pyc 2>/dev/null || true
+  if [ -d "$PATCH_PYCACHE_DIR" ] && [ -z "$(ls -A "$PATCH_PYCACHE_DIR" 2>/dev/null)" ]; then
+    rmdir "$PATCH_PYCACHE_DIR" 2>/dev/null || true
   fi
 
   if [ -d "$PATCH_DIR" ]; then
@@ -101,10 +123,18 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 
 printf '%bSummary:%b\n' "$GREEN" "$RESET"
-if [ "$restored_hook" -eq 1 ]; then
-  printf '  - Restored sitecustomize.py from backup\n'
-elif [ "$removed_hook" -eq 1 ]; then
-  printf '  - Removed sitecustomize.py hook\n'
+if [ "$removed_loader" -eq 1 ] || [ "$removed_bootstrap" -eq 1 ] || [ "$restored_hook" -eq 1 ] || [ "$removed_hook" -eq 1 ]; then
+  if [ "$removed_loader" -eq 1 ]; then
+    printf '  - Removed .pth bootstrap loader\n'
+  fi
+  if [ "$removed_bootstrap" -eq 1 ]; then
+    printf '  - Removed bootstrap hook module\n'
+  fi
+  if [ "$restored_hook" -eq 1 ]; then
+    printf '  - Restored sitecustomize.py from backup\n'
+  elif [ "$removed_hook" -eq 1 ]; then
+    printf '  - Removed sitecustomize.py hook\n'
+  fi
 else
   printf '  - No hook changes needed\n'
 fi

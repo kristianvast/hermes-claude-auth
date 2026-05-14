@@ -27,7 +27,7 @@ cd hermes-claude-auth
 
 What `install.sh` does:
 - Copies `anthropic_billing_bypass.py` to `~/.hermes/patches/`
-- Installs the import hook as `sitecustomize.py` in the hermes venv's site-packages
+- Installs a `.pth` shim + bootstrap module into the hermes venv's site-packages (this loads the hook at interpreter startup; see "How it works" below for why a `.pth` and not `sitecustomize.py`)
 - Restarts `hermes-gateway.service` if running
 
 ## Uninstall
@@ -47,13 +47,17 @@ What `install.sh` does:
 8. **Temperature fix**: Strips non-default `temperature` on Opus 4.6 adaptive thinking, which otherwise rejects with HTTP 400
 9. **Account metadata**: Maps `~/.claude.json::oauthAccount.accountUuid` to `metadata.user_id` (Anthropic rejected the older `account_uuid` key with HTTP 400 on 2026-04-29)
 
-Installed through a `sitecustomize.py` MetaPathFinder hook, so it runs at interpreter startup with no source modifications.
+Installed through a `.pth` file in the venv's site-packages that imports a small bootstrap module at interpreter startup, which in turn registers a `MetaPathFinder` hook for `agent.anthropic_adapter`. No source modifications.
+
+The `.pth` shim runs *before* `site.py` imports `sitecustomize`, on every platform. An earlier version of this installer wrote a `sitecustomize.py` into site-packages directly, which failed silently on Debian/Ubuntu — those distros ship `/usr/lib/pythonX.Y/sitecustomize.py` for apport and it wins import priority over the venv-local one, so the bypass hook never ran. The current installer auto-migrates legacy installs.
 
 ## What gets modified
 | File | Action |
 |------|--------|
 | `~/.hermes/patches/anthropic_billing_bypass.py` | Created |
-| `<venv>/lib/pythonX.Y/site-packages/sitecustomize.py` | Created or replaced |
+| `<venv>/lib/pythonX.Y/site-packages/hermes_claude_auth.pth` | Created |
+| `<venv>/lib/pythonX.Y/site-packages/_hermes_claude_auth_bootstrap.py` | Created |
+| `<venv>/lib/pythonX.Y/site-packages/sitecustomize.py` | Removed if left behind by a legacy install (original restored from `.pre-hermes-claude-auth` backup when present) |
 | hermes-agent source files | NOT modified |
 
 ## Compatibility
@@ -67,6 +71,13 @@ Installed through a `sitecustomize.py` MetaPathFinder hook, so it runs at interp
 - **"hermes-agent not found"**: Make sure Hermes is installed at `~/.hermes/hermes-agent/`
 - **"No virtualenv found"**: Set `HERMES_VENV` to point to your venv
 - **Patch not loading**: Check `journalctl --user -u hermes-gateway -n 50` for `[anthropic_billing_bypass]` or `[hermes-claude-auth]` messages
+- **Bypass silently inactive on Debian/Ubuntu** (legacy `sitecustomize.py` installs only): If you installed before the `.pth` migration, the bypass may never have actually run on your host. Debian/Ubuntu ship `/usr/lib/pythonX.Y/sitecustomize.py` for apport, and that one wins import priority over the venv-local `sitecustomize.py`, so the hook never installs. Quick diagnostic:
+
+  ```bash
+  cd ~/.hermes/hermes-agent && ./venv/bin/python -c "import anthropic_billing_bypass"
+  ```
+
+  `ModuleNotFoundError` means the hook isn't running. Fix is to re-run `./install.sh` — the current installer uses a `.pth` shim that sidesteps the apport collision and auto-migrates legacy installs.
 
 ### Auth issues
 

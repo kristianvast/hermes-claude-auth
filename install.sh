@@ -10,6 +10,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HERMES_AGENT_DIR="$HOME/.hermes/hermes-agent"
 PATCHES_DIR="$HOME/.hermes/patches"
 MARKER="# hermes-claude-auth managed"
+BOOTSTRAP_NAME="_hermes_claude_auth_bootstrap.py"
+PTH_NAME="hermes_claude_auth.pth"
 
 if [ ! -d "$HERMES_AGENT_DIR" ]; then
     printf "${RED}[✗] hermes-agent not found at %s${RESET}\n" "$HERMES_AGENT_DIR"
@@ -46,21 +48,57 @@ cp "$SCRIPT_DIR/anthropic_billing_bypass.py" "$PATCHES_DIR/anthropic_billing_byp
 chmod 644 "$PATCHES_DIR/anthropic_billing_bypass.py"
 printf "${GREEN}[✓] Copied patch to %s/${RESET}\n" "$PATCHES_DIR"
 
-SITECUSTOMIZE="$SITE_PACKAGES/sitecustomize.py"
+# Clear any stale bytecode in the patches dir so the new file is imported fresh
+# next time the hook fires.  Harmless if the cache doesn't exist.
+rm -rf "$PATCHES_DIR/__pycache__" 2>/dev/null || true
 
-if [ ! -f "$SITECUSTOMIZE" ]; then
-    cp "$SCRIPT_DIR/sitecustomize_hook.py" "$SITECUSTOMIZE"
-elif grep -q "$MARKER" "$SITECUSTOMIZE"; then
-    cp "$SCRIPT_DIR/sitecustomize_hook.py" "$SITECUSTOMIZE"
-else
-    BACKUP="$SITECUSTOMIZE.pre-hermes-claude-auth"
-    cp "$SITECUSTOMIZE" "$BACKUP"
-    printf "${YELLOW}[!] Backed up existing sitecustomize.py to %s${RESET}\n" "$BACKUP"
-    cp "$SCRIPT_DIR/sitecustomize_hook.py" "$SITECUSTOMIZE"
+# --- Install hook via .pth shim ------------------------------------------------
+#
+# .pth files are processed by site.py *before* it imports sitecustomize, on every
+# platform.  Earlier versions of this installer wrote a sitecustomize.py into
+# site-packages directly, which fails silently on Debian/Ubuntu because those
+# distros ship /usr/lib/pythonX.Y/sitecustomize.py for apport and it wins import
+# priority over the venv-local one (the venv's never gets imported).  Routing
+# through a .pth shim avoids the collision and works on every distro.
+
+BOOTSTRAP_PATH="$SITE_PACKAGES/$BOOTSTRAP_NAME"
+PTH_PATH="$SITE_PACKAGES/$PTH_NAME"
+
+cp "$SCRIPT_DIR/$BOOTSTRAP_NAME" "$BOOTSTRAP_PATH"
+chmod 644 "$BOOTSTRAP_PATH"
+printf "${GREEN}[✓] Installed bootstrap module into %s${RESET}\n" "$BOOTSTRAP_PATH"
+
+cp "$SCRIPT_DIR/$PTH_NAME" "$PTH_PATH"
+chmod 644 "$PTH_PATH"
+printf "${GREEN}[✓] Installed .pth shim into %s${RESET}\n" "$PTH_PATH"
+
+# Migrate an existing sitecustomize.py-style install, if any.
+#
+# - If we placed it there in a previous install (marker present), remove it and
+#   restore the original pre-existing sitecustomize.py from backup if one was
+#   saved.  Without the .pth shim, that file is dead weight on Debian/Ubuntu
+#   anyway, and on Fedora having both works but ours is now redundant.
+# - If a non-ours sitecustomize.py exists, leave it untouched.
+SITECUSTOMIZE="$SITE_PACKAGES/sitecustomize.py"
+LEGACY_BACKUP="$SITECUSTOMIZE.pre-hermes-claude-auth"
+if [ -f "$SITECUSTOMIZE" ] && grep -q "$MARKER" "$SITECUSTOMIZE"; then
+    if [ -f "$LEGACY_BACKUP" ]; then
+        mv "$LEGACY_BACKUP" "$SITECUSTOMIZE"
+        printf "${YELLOW}[~] Migrated legacy sitecustomize.py install — restored your original from backup${RESET}\n"
+    else
+        # No prior sitecustomize.py existed; remove ours so future runs of /usr/bin/python
+        # don't have a stray hook in this venv after this package is uninstalled.
+        rm -f "$SITECUSTOMIZE"
+        printf "${YELLOW}[~] Migrated legacy sitecustomize.py install — removed superseded hook${RESET}\n"
+    fi
 fi
 
-chmod 644 "$SITECUSTOMIZE"
-printf "${GREEN}[✓] Installed hook into %s${RESET}\n" "$SITECUSTOMIZE"
+# Clear any stale bytecode for our installed files so the next interpreter
+# startup re-imports them.
+find "$SITE_PACKAGES" \
+    -maxdepth 3 \
+    \( -name '_hermes_claude_auth_bootstrap*.pyc' -o -name 'sitecustomize*.pyc' \) \
+    -delete 2>/dev/null || true
 
 # macOS: hermes-agent reads Claude subscription credentials from
 # ~/.claude/.credentials.json, but Claude Code on macOS stores them in
@@ -91,6 +129,7 @@ else
 fi
 
 printf "\n${GREEN}Installation complete.${RESET}\n"
-printf "  Patch:  %s/anthropic_billing_bypass.py\n" "$PATCHES_DIR"
-printf "  Hook:   %s\n" "$SITECUSTOMIZE"
-printf "  Venv:   %s\n" "$VENV_DIR"
+printf "  Patch:     %s/anthropic_billing_bypass.py\n" "$PATCHES_DIR"
+printf "  Bootstrap: %s\n" "$BOOTSTRAP_PATH"
+printf "  .pth shim: %s\n" "$PTH_PATH"
+printf "  Venv:      %s\n" "$VENV_DIR"

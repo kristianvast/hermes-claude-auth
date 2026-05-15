@@ -21,10 +21,15 @@ from __future__ import annotations
 import os
 import sys
 
-_PATCHES_DIR = os.environ.get(
-    "HERMES_PATCHES_DIR",
-    os.path.expanduser("~/.hermes/patches"),
-)
+
+def _default_patches_dir() -> str:
+    if sys.platform == "win32":
+        localappdata = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return os.path.join(localappdata, "hermes", "patches")
+    return os.path.expanduser("~/.hermes/patches")
+
+
+_PATCHES_DIR = os.environ.get("HERMES_PATCHES_DIR") or _default_patches_dir()
 _TARGET_MODULE = "agent.anthropic_adapter"
 
 if os.path.isdir(_PATCHES_DIR) and _PATCHES_DIR not in sys.path:

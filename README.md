@@ -8,12 +8,16 @@ Patches hermes-agent at runtime to pass Anthropic's server-side OAuth content va
 On 2026-04-04, Anthropic added server-side validation that rejects OAuth requests from third-party tools. This patch adds the billing header signature and system prompt structure the API expects.
 
 ## Prerequisites
-- hermes-agent installed (`~/.hermes/hermes-agent/`)
+- hermes-agent installed
+  - Linux/macOS: `~/.hermes/hermes-agent/`
+  - Windows: `%LOCALAPPDATA%\hermes\hermes-agent\`
 - Claude Code CLI authenticated (valid credentials at `~/.claude/.credentials.json`)
 - hermes-agent configured for OAuth (`credential_pool` has a `claude_code` entry in `~/.hermes/auth.json`)
 - Python 3.11+
 
 ## Install
+
+### Linux / macOS
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kristianvast/hermes-claude-auth/main/install-remote.sh | bash
 ```
@@ -30,10 +34,30 @@ What `install.sh` does:
 - Installs the import hook as `sitecustomize.py` in the hermes venv's site-packages
 - Restarts `hermes-gateway.service` if running
 
+### Windows
+```powershell
+git clone https://github.com/kristianvast/hermes-claude-auth.git
+cd hermes-claude-auth
+.\install.ps1
+```
+
+What `install.ps1` does:
+- Copies `anthropic_billing_bypass.py` to `%LOCALAPPDATA%\hermes\patches\`
+- Installs the import hook as `sitecustomize.py` in the hermes venv's site-packages
+- Restart hermes-gateway manually after installation
+
 ## Uninstall
+
+### Linux / macOS
 ```bash
 ./uninstall.sh          # remove hook only
 ./uninstall.sh --purge  # remove hook + patch file
+```
+
+### Windows
+```powershell
+.\uninstall.ps1          # remove hook only
+.\uninstall.ps1 -Purge   # remove hook + patch file
 ```
 
 ## How it works
@@ -52,13 +76,15 @@ Installed through a `sitecustomize.py` MetaPathFinder hook, so it runs at interp
 ## What gets modified
 | File | Action |
 |------|--------|
-| `~/.hermes/patches/anthropic_billing_bypass.py` | Created |
-| `<venv>/lib/pythonX.Y/site-packages/sitecustomize.py` | Created or replaced |
+| `~/.hermes/patches/anthropic_billing_bypass.py` (Linux/macOS) | Created |
+| `%LOCALAPPDATA%\hermes\patches\anthropic_billing_bypass.py` (Windows) | Created |
+| `<venv>/lib/pythonX.Y/site-packages/sitecustomize.py` (Linux/macOS) | Created or replaced |
+| `<venv>\Lib\site-packages\sitecustomize.py` (Windows) | Created or replaced |
 | hermes-agent source files | NOT modified |
 
 ## Compatibility
 - Tested with hermes-agent on Python 3.11+
-- Linux and macOS
+- Linux, macOS, and Windows
 - Depends on `build_anthropic_kwargs(is_oauth=...)` in `agent.anthropic_adapter`, so it may need updating if hermes-agent changes that interface
 
 ## Troubleshooting

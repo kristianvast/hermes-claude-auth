@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from anthropic_billing_bypass import (
     _BILLING_ENTRYPOINT,
     _MCP_HERMES_NAMESPACE,
+    _OLD_SYSTEM_IDENTITY,
+    _SESSION_ID,
     _SYSTEM_IDENTITY,
     _fix_temperature_for_oauth_adaptive,
     _install_response_pascalcase_unhook,
@@ -452,3 +454,92 @@ def test_response_unhook_is_idempotent():
 
     msg, _reason = adapter.normalize_anthropic_response(response=object())
     assert msg.tool_calls[0].function.name == "bash"
+
+
+# ---------------------------------------------------------------------------
+# CC 2.1.117 wire-format parity tests (v1.6.0)
+# ---------------------------------------------------------------------------
+
+
+def test_system_identity_is_new_agent_sdk_prefix():
+    """Verify _SYSTEM_IDENTITY uses the CC 2.1.117 identity string."""
+    assert _SYSTEM_IDENTITY == "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+    assert _OLD_SYSTEM_IDENTITY == "You are Claude Code, Anthropic's official CLI for Claude."
+
+
+def test_bypass_replaces_old_identity_with_new(basic_api_kwargs):
+    """When hermes-agent sends the old identity, bypass should replace it."""
+    assert basic_api_kwargs["system"][0]["text"].startswith(_OLD_SYSTEM_IDENTITY)
+
+    apply_claude_code_bypass(basic_api_kwargs, "2.1.117")
+
+    system = basic_api_kwargs["system"]
+    identity_entry = system[1]
+    assert identity_entry["text"] == _SYSTEM_IDENTITY
+    assert identity_entry.get("cache_control") == {"type": "ephemeral", "ttl": "1h"}
+
+
+def test_bypass_preserves_new_identity(new_identity_api_kwargs):
+    """When system already has the new identity, bypass should keep it."""
+    apply_claude_code_bypass(new_identity_api_kwargs, "2.1.117")
+
+    system = new_identity_api_kwargs["system"]
+    identity_entry = system[1]
+    assert identity_entry["text"] == _SYSTEM_IDENTITY
+
+
+def test_bypass_injects_cache_control_on_identity(basic_api_kwargs):
+    """Identity system entry should have ephemeral cache_control."""
+    apply_claude_code_bypass(basic_api_kwargs, "2.1.117")
+
+    identity_entry = basic_api_kwargs["system"][1]
+    assert identity_entry["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+
+def test_bypass_injects_context_management_via_extra_body(basic_api_kwargs):
+    """context_management should be injected via extra_body when thinking is active."""
+    basic_api_kwargs["thinking"] = {"type": "adaptive"}
+    apply_claude_code_bypass(basic_api_kwargs, "2.1.117")
+
+    extra_body = basic_api_kwargs.get("extra_body", {})
+    cm = extra_body.get("context_management")
+    assert cm is not None
+    assert cm == {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}
+
+
+def test_bypass_skips_context_management_when_top_level_present(basic_api_kwargs):
+    """If context_management is already set at top level, bypass should not inject."""
+    basic_api_kwargs["context_management"] = {"edits": [{"type": "custom"}]}
+    basic_api_kwargs["thinking"] = {"type": "adaptive"}
+
+    apply_claude_code_bypass(basic_api_kwargs, "2.1.117")
+
+    assert basic_api_kwargs["context_management"] == {"edits": [{"type": "custom"}]}
+
+
+def test_bypass_injects_session_id_header(basic_api_kwargs):
+    """X-Claude-Code-Session-Id should be present in extra_headers."""
+    apply_claude_code_bypass(basic_api_kwargs, "2.1.117")
+
+    headers = basic_api_kwargs["extra_headers"]
+    assert "x-claude-code-session-id" in headers
+    assert headers["x-claude-code-session-id"] == _SESSION_ID
+    import uuid
+    uuid.UUID(headers["x-claude-code-session-id"], version=4)
+
+
+def test_bypass_uses_node_v24(basic_api_kwargs):
+    """Stainless runtime version should match CC 2.1.117 (node v24.3.0)."""
+    apply_claude_code_bypass(basic_api_kwargs, "2.1.117")
+
+    headers = basic_api_kwargs["extra_headers"]
+    assert headers["x-stainless-runtime-version"] == "v24.3.0"
+
+
+
+def test_bypass_skips_context_management_without_thinking(basic_api_kwargs):
+    """context_management should NOT be injected when thinking is not enabled."""
+    apply_claude_code_bypass(basic_api_kwargs, "2.1.117")
+
+    extra_body = basic_api_kwargs.get("extra_body", {})
+    assert "context_management" not in extra_body

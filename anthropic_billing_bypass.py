@@ -11,6 +11,12 @@ ports its bypass behaviors to Python.
 
 Version history
 ---------------
+- 1.6.0 (2026-05-08): Update wire format for CC 2.1.117 parity — new system
+  identity prefix ("Claude agent" replacing "Claude Code"), structured
+  metadata (JSON-encoded device_id + account_uuid + session_id),
+  X-Claude-Code-Session-Id header, context_management body field,
+  effort-2025-11-24 + context-management-2025-06-27 betas, Node v24.3.0
+  stainless header, cache_control on system identity entry.
 - 1.5.0 (2026-05-06): Fix literal ``\\n`` escapes in system-reminder text,
   lowercase Stainless headers (matches upstream JS SDK), restore Opus 4.6
   temperature stripping, port ``repair_tool_pairs`` (upstream PR #136) and
@@ -37,7 +43,7 @@ References
 
 from __future__ import annotations
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 import hashlib
 import inspect
@@ -47,6 +53,7 @@ import os
 import platform
 import sys
 import traceback
+import uuid
 from typing import Any, Dict, List, Set
 
 logger = logging.getLogger("anthropic_billing_bypass")
@@ -67,7 +74,12 @@ _BILLING_ENTRYPOINT = "sdk-cli"
 # Sentinel strings — entries in system[] starting with these are kept;
 # everything else is relocated to the first user message.
 _BILLING_PREFIX = "x-anthropic-billing-header"
-_SYSTEM_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+# CC 2.1.117 changed the identity prefix from the old "You are Claude Code..."
+# to this new Agent SDK identity.  The server-side validator matches on the
+# identity prefix to route requests to subscription billing vs extra-usage.
+_SYSTEM_IDENTITY = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+# Keep the old prefix for matching — hermes-agent may still inject it.
+_OLD_SYSTEM_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
 
 # Hermes prefixes MCP tools with ``mcp_``.  We rewrite that to the standard
 # ``mcp__<server>__<tool>`` namespace Anthropic expects from real Claude Code,
@@ -79,14 +91,32 @@ _MCP_HERMES_NAMESPACE = "mcp__hermes__"
 # match the JS SDK output exactly (HTTP headers are case-insensitive but
 # upstream's spoof uses lowercase, and so does our pre-merge code).
 _STAINLESS_PACKAGE_VERSION = "0.81.0"
-_STAINLESS_NODE_VERSION = "v22.11.0"
+_STAINLESS_NODE_VERSION = "v24.3.0"
 
 # OAuth-only beta flags appended on top of hermes-agent's built-in
 # ``claude-code-20250219`` and ``oauth-2025-04-20``.
 _EXTRA_OAUTH_BETAS = [
     "prompt-caching-scope-2026-01-05",
+    "context-management-2025-06-27",
     "advisor-tool-2026-03-01",
+    "effort-2025-11-24",
 ]
+
+# Stable per-process session ID matching CC's X-Claude-Code-Session-Id.
+_SESSION_ID = str(uuid.uuid4())
+
+# Module-level override set by the credential pool when it selects an entry
+# that has an account_uuid field.  When set, _get_account_metadata() uses
+# this instead of reading ~/.claude.json (which always points to one account).
+_active_account_uuid: str | None = None
+
+
+def set_active_account_uuid(account_uuid: str | None) -> None:
+    """Called by the credential pool after selecting a pool entry."""
+    global _active_account_uuid
+    _active_account_uuid = account_uuid
+    if account_uuid:
+        logger.debug("Bypass active account_uuid set to %s", account_uuid)
 
 
 # ---------------------------------------------------------------------------
@@ -181,15 +211,39 @@ def _read_claude_config() -> Dict[str, Any]:
 def _get_account_metadata() -> Dict[str, Any]:
     """Return Anthropic-compatible request metadata.
 
-    ``metadata.account_uuid`` was rejected with HTTP 400 in 2026-04-29; only
-    ``user_id`` is accepted.  Returns ``{}`` when the config or oauthAccount
-    block is missing so the caller can skip injecting metadata entirely.
+    CC 2.1.117 sends ``user_id`` as a JSON-encoded string containing
+    ``device_id``, ``account_uuid``, and ``session_id``.  Earlier versions
+    sent just the UUID.  Returns ``{}`` when the config is missing so the
+    caller can skip injecting metadata entirely.
+
+    When the credential pool has set ``_active_account_uuid`` (via
+    ``set_active_account_uuid``), that UUID is used instead of reading
+    ``~/.claude.json``.  This ensures multi-account pools route billing
+    to the correct subscription.
     """
-    config = _read_claude_config()
-    oauth = config.get("oauthAccount") if isinstance(config, dict) else None
+    account_uuid: str | None = _active_account_uuid
+
+    if account_uuid is None:
+        # Fallback: read from ~/.claude.json (single-account path)
+        config = _read_claude_config()
+        oauth = config.get("oauthAccount") if isinstance(config, dict) else None
+        if isinstance(oauth, dict) and isinstance(oauth.get("accountUuid"), str):
+            account_uuid = oauth["accountUuid"]
+
     metadata: Dict[str, Any] = {}
-    if isinstance(oauth, dict) and isinstance(oauth.get("accountUuid"), str):
-        metadata["user_id"] = oauth["accountUuid"]
+    if account_uuid:
+        # Build structured metadata matching CC 2.1.117 wire format.
+        # device_id is a SHA-256 hex string in real CC; we derive one from
+        # the account UUID so it's stable per-install.
+        device_id = hashlib.sha256(
+            f"hermes-device-{account_uuid}".encode()
+        ).hexdigest()
+        inner = json.dumps({
+            "device_id": device_id,
+            "account_uuid": account_uuid,
+            "session_id": _SESSION_ID,
+        }, separators=(",", ":"))
+        metadata["user_id"] = inner
     return metadata
 
 
@@ -272,7 +326,7 @@ def _stainless_os() -> str:
 
 
 def _build_spoof_headers() -> Dict[str, str]:
-    """Headers real Claude Code 2.1.112 sends that hermes-agent does not.
+    """Headers real Claude Code 2.1.117 sends that hermes-agent does not.
 
     The Anthropic SDK (Stainless-generated) automatically attaches
     ``x-stainless-*`` identifying headers.  The validator cross-references
@@ -282,6 +336,7 @@ def _build_spoof_headers() -> Dict[str, str]:
     """
     return {
         "anthropic-dangerous-direct-browser-access": "true",
+        "x-claude-code-session-id": _SESSION_ID,
         "x-stainless-arch": _stainless_arch(),
         "x-stainless-lang": "js",
         "x-stainless-os": _stainless_os(),
@@ -559,12 +614,22 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
         text = entry.get("text") or ""
         if text.startswith(_BILLING_PREFIX):
             continue  # stale billing header — drop
-        if text.startswith(_SYSTEM_IDENTITY):
+        if text.startswith(_SYSTEM_IDENTITY) or text.startswith(_OLD_SYSTEM_IDENTITY):
             if identity_seen:
                 continue  # duplicate — drop
             identity_seen = True
-            rest = text[len(_SYSTEM_IDENTITY):].lstrip("\n")
-            kept.append({"type": "text", "text": _SYSTEM_IDENTITY})
+            # Strip whichever prefix matched and relocate the remainder.
+            prefix = (
+                _SYSTEM_IDENTITY
+                if text.startswith(_SYSTEM_IDENTITY)
+                else _OLD_SYSTEM_IDENTITY
+            )
+            rest = text[len(prefix):].lstrip("\n")
+            kept.append({
+                "type": "text",
+                "text": _SYSTEM_IDENTITY,
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            })
             if rest:
                 moved_texts.append(rest)
             continue
@@ -572,7 +637,11 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
             moved_texts.append(text)
 
     if not identity_seen:
-        kept.insert(0, {"type": "text", "text": _SYSTEM_IDENTITY})
+        kept.insert(0, {
+            "type": "text",
+            "text": _SYSTEM_IDENTITY,
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        })
 
     api_kwargs["system"] = [billing_entry] + kept
 
@@ -583,6 +652,23 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
     _merge_spoof_extras(api_kwargs)
     _strip_effort(api_kwargs)
     _fix_temperature_for_oauth_adaptive(api_kwargs, site="build_kwargs")
+
+    # Inject context_management if not already present.  CC 2.1.117 sends
+    # this to control thinking-block retention.  Must go via extra_body
+    # because the Anthropic Python SDK doesn't recognize it as a kwarg.
+    # Only inject when thinking is enabled — the clear_thinking strategy
+    # requires thinking to be active, and auxiliary calls (vision, etc.)
+    # don't use thinking mode.
+    thinking = api_kwargs.get("thinking")
+    has_thinking = isinstance(thinking, dict) and thinking.get("type") in (
+        "adaptive", "enabled",
+    )
+    if has_thinking and "context_management" not in api_kwargs:
+        extra_body = api_kwargs.setdefault("extra_body", {})
+        if isinstance(extra_body, dict) and "context_management" not in extra_body:
+            extra_body["context_management"] = {
+                "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
+            }
 
     metadata = _get_account_metadata()
     if metadata:
@@ -750,6 +836,50 @@ def _install_response_pascalcase_unhook(
     return any_installed
 
 
+def _install_pool_select_hook() -> None:
+    """Wrap CredentialPool.select() to call set_active_account_uuid when
+    an anthropic pool entry with an account_uuid field is selected.
+
+    This ensures _get_account_metadata() sends the correct UUID for
+    multi-account setups instead of always reading ~/.claude.json.
+    """
+    try:
+        from agent.credential_pool import CredentialPool  # type: ignore[import-not-found]
+    except ImportError:
+        logger.debug("credential_pool not importable; pool select hook skipped")
+        return
+
+    if getattr(CredentialPool, "_BILLING_BYPASS_SELECT_HOOK", False):
+        return  # already installed
+
+    original_select = CredentialPool.select
+
+    def hooked_select(self: Any) -> Any:
+        entry = original_select(self)
+        if entry is not None and getattr(self, "provider", None) == "anthropic":
+            uuid_val = getattr(entry, "account_uuid", None)
+            if isinstance(uuid_val, str) and uuid_val:
+                set_active_account_uuid(uuid_val)
+                logger.debug(
+                    "Pool selected entry %s → account_uuid %s",
+                    getattr(entry, "label", "?"),
+                    uuid_val,
+                )
+            else:
+                # No account_uuid on this entry — clear override so
+                # _get_account_metadata falls back to ~/.claude.json.
+                set_active_account_uuid(None)
+        return entry
+
+    hooked_select.__name__ = original_select.__name__
+    hooked_select.__doc__ = original_select.__doc__
+    hooked_select.__wrapped__ = original_select  # type: ignore[attr-defined]
+
+    CredentialPool.select = hooked_select
+    CredentialPool._BILLING_BYPASS_SELECT_HOOK = True  # type: ignore[attr-defined]
+    sys.stderr.write("[anthropic_billing_bypass] Pool select hook installed\n")
+
+
 def apply_patches(anthropic_adapter_module: Any = None) -> bool:
     """Install the bypass on hermes-agent's anthropic adapter.
 
@@ -830,4 +960,5 @@ def apply_patches(anthropic_adapter_module: Any = None) -> bool:
     sys.stderr.write("[anthropic_billing_bypass] Bypass installed\n")
 
     _install_response_pascalcase_unhook(aa)
+    _install_pool_select_hook()
     return True

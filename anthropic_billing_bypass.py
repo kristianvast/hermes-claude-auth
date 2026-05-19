@@ -105,6 +105,19 @@ _EXTRA_OAUTH_BETAS = [
 # Stable per-process session ID matching CC's X-Claude-Code-Session-Id.
 _SESSION_ID = str(uuid.uuid4())
 
+# Module-level override set by the credential pool when it selects an entry
+# that has an account_uuid field.  When set, _get_account_metadata() uses
+# this instead of reading ~/.claude.json (which always points to one account).
+_active_account_uuid: str | None = None
+
+
+def set_active_account_uuid(account_uuid: str | None) -> None:
+    """Called by the credential pool after selecting a pool entry."""
+    global _active_account_uuid
+    _active_account_uuid = account_uuid
+    if account_uuid:
+        logger.debug("Bypass active account_uuid set to %s", account_uuid)
+
 
 # ---------------------------------------------------------------------------
 # Tool name transforms (upstream PR #191 + hermes namespacing)
@@ -202,15 +215,26 @@ def _get_account_metadata() -> Dict[str, Any]:
     ``device_id``, ``account_uuid``, and ``session_id``.  Earlier versions
     sent just the UUID.  Returns ``{}`` when the config is missing so the
     caller can skip injecting metadata entirely.
+
+    When the credential pool has set ``_active_account_uuid`` (via
+    ``set_active_account_uuid``), that UUID is used instead of reading
+    ``~/.claude.json``.  This ensures multi-account pools route billing
+    to the correct subscription.
     """
-    config = _read_claude_config()
-    oauth = config.get("oauthAccount") if isinstance(config, dict) else None
+    account_uuid: str | None = _active_account_uuid
+
+    if account_uuid is None:
+        # Fallback: read from ~/.claude.json (single-account path)
+        config = _read_claude_config()
+        oauth = config.get("oauthAccount") if isinstance(config, dict) else None
+        if isinstance(oauth, dict) and isinstance(oauth.get("accountUuid"), str):
+            account_uuid = oauth["accountUuid"]
+
     metadata: Dict[str, Any] = {}
-    if isinstance(oauth, dict) and isinstance(oauth.get("accountUuid"), str):
+    if account_uuid:
         # Build structured metadata matching CC 2.1.117 wire format.
         # device_id is a SHA-256 hex string in real CC; we derive one from
         # the account UUID so it's stable per-install.
-        account_uuid = oauth["accountUuid"]
         device_id = hashlib.sha256(
             f"hermes-device-{account_uuid}".encode()
         ).hexdigest()
@@ -812,6 +836,50 @@ def _install_response_pascalcase_unhook(
     return any_installed
 
 
+def _install_pool_select_hook() -> None:
+    """Wrap CredentialPool.select() to call set_active_account_uuid when
+    an anthropic pool entry with an account_uuid field is selected.
+
+    This ensures _get_account_metadata() sends the correct UUID for
+    multi-account setups instead of always reading ~/.claude.json.
+    """
+    try:
+        from agent.credential_pool import CredentialPool  # type: ignore[import-not-found]
+    except ImportError:
+        logger.debug("credential_pool not importable; pool select hook skipped")
+        return
+
+    if getattr(CredentialPool, "_BILLING_BYPASS_SELECT_HOOK", False):
+        return  # already installed
+
+    original_select = CredentialPool.select
+
+    def hooked_select(self: Any) -> Any:
+        entry = original_select(self)
+        if entry is not None and getattr(self, "provider", None) == "anthropic":
+            uuid_val = getattr(entry, "account_uuid", None)
+            if isinstance(uuid_val, str) and uuid_val:
+                set_active_account_uuid(uuid_val)
+                logger.debug(
+                    "Pool selected entry %s → account_uuid %s",
+                    getattr(entry, "label", "?"),
+                    uuid_val,
+                )
+            else:
+                # No account_uuid on this entry — clear override so
+                # _get_account_metadata falls back to ~/.claude.json.
+                set_active_account_uuid(None)
+        return entry
+
+    hooked_select.__name__ = original_select.__name__
+    hooked_select.__doc__ = original_select.__doc__
+    hooked_select.__wrapped__ = original_select  # type: ignore[attr-defined]
+
+    CredentialPool.select = hooked_select
+    CredentialPool._BILLING_BYPASS_SELECT_HOOK = True  # type: ignore[attr-defined]
+    sys.stderr.write("[anthropic_billing_bypass] Pool select hook installed\n")
+
+
 def apply_patches(anthropic_adapter_module: Any = None) -> bool:
     """Install the bypass on hermes-agent's anthropic adapter.
 
@@ -892,4 +960,5 @@ def apply_patches(anthropic_adapter_module: Any = None) -> bool:
     sys.stderr.write("[anthropic_billing_bypass] Bypass installed\n")
 
     _install_response_pascalcase_unhook(aa)
+    _install_pool_select_hook()
     return True

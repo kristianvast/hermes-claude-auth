@@ -11,6 +11,13 @@ ports its bypass behaviors to Python.
 
 Version history
 ---------------
+- 1.5.1 (2026-05-23): Restore Claude Code 2.1.112 subscription auth parity
+  by porting griffinmartin/opencode-claude-auth PR #207.  Forcibly override
+  the outgoing ``user-agent`` to ``claude-cli/2.1.112 (external, sdk-cli)``
+  so it matches the billing header's ``cc_entrypoint=sdk-cli``, and pin the
+  signing version to 2.1.112 (was: dynamically detected, drifted to 2.1.72
+  on stock hermes installs).  Fixes ``HTTP 400 You're out of extra usage``
+  on Max/Pro subscriptions.
 - 1.5.0 (2026-05-06): Fix literal ``\\n`` escapes in system-reminder text,
   lowercase Stainless headers (matches upstream JS SDK), restore Opus 4.6
   temperature stripping, port ``repair_tool_pairs`` (upstream PR #136) and
@@ -37,7 +44,7 @@ References
 
 from __future__ import annotations
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 
 import hashlib
 import inspect
@@ -80,6 +87,15 @@ _MCP_HERMES_NAMESPACE = "mcp__hermes__"
 # upstream's spoof uses lowercase, and so does our pre-merge code).
 _STAINLESS_PACKAGE_VERSION = "0.81.0"
 _STAINLESS_NODE_VERSION = "v22.11.0"
+
+# Pinned CC version used for BOTH the billing-header signature AND the
+# user-agent header.  Anthropic's validator cross-references these; a
+# mismatch (e.g. hermes detecting an installed 2.1.72 Claude CLI while the
+# billing header claims cc_entrypoint=sdk-cli which is a 2.1.112+ thing)
+# flags the request as third-party and routes traffic to extra usage.
+# Mirrors upstream ``ccVersion: "2.1.112"`` from
+# griffinmartin/opencode-claude-auth PR #207.
+_PINNED_CC_VERSION = "2.1.112"
 
 # OAuth-only beta flags appended on top of hermes-agent's built-in
 # ``claude-code-20250219`` and ``oauth-2025-04-20``.
@@ -295,12 +311,28 @@ def _build_spoof_headers() -> Dict[str, str]:
 
 def _merge_spoof_extras(api_kwargs: Dict[str, Any]) -> None:
     """Existing extra_headers/extra_query take precedence so hermes's own
-    headers (e.g. fast-mode beta) survive — additive spoof only."""
+    headers (e.g. fast-mode beta) survive — additive spoof only.
+
+    Exception: ``user-agent`` is forcibly overridden to match the billing
+    header's ``cc_entrypoint=sdk-cli``.  Hermes-agent's adapter sets
+    ``claude-cli/{detected-version} (external, cli)`` at client-construction
+    time, but the billing header (built later in this module) claims
+    ``cc_entrypoint=sdk-cli``.  Anthropic's validator catches the mismatch
+    and routes the request to third-party billing.  Mirror upstream PR #207
+    by aligning user-agent + version + entrypoint to a single fingerprint.
+    """
     merged_headers: Dict[str, str] = dict(_build_spoof_headers())
     existing_headers = api_kwargs.get("extra_headers")
     if isinstance(existing_headers, dict):
         for k, v in existing_headers.items():
             merged_headers[k] = v
+    # Force user-agent to (external, sdk-cli) regardless of what hermes set
+    # on the SDK client; existing_headers handling above would have let
+    # hermes's "(external, cli)" win.
+    merged_headers["user-agent"] = (
+        f"claude-cli/{_PINNED_CC_VERSION} (external, sdk-cli)"
+    )
+    merged_headers["x-app"] = "cli"
     api_kwargs["extra_headers"] = merged_headers
 
     merged_query: Dict[str, Any] = {"beta": "true"}
@@ -600,18 +632,17 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
 
 
 def _get_version_safely(aa_module: Any) -> str:
-    getter = getattr(aa_module, "_get_claude_code_version", None)
-    if callable(getter):
-        try:
-            version = getter()
-            if isinstance(version, str) and version and version[0].isdigit():
-                return version
-        except Exception:
-            pass
-    fallback = getattr(aa_module, "_CLAUDE_CODE_VERSION_FALLBACK", None)
-    if isinstance(fallback, str) and fallback:
-        return fallback
-    return "2.1.112"
+    """Return the Claude Code version used to sign the billing header.
+
+    Pinned to ``_PINNED_CC_VERSION`` so the billing header's
+    ``cc_version=`` and the user-agent's ``claude-cli/<version>`` always
+    agree.  Detecting hermes's installed Claude CLI dynamically lets the
+    user-agent / billing-header version drift apart the moment hermes lags
+    behind upstream.  ``aa_module`` is preserved in the signature so the
+    monkey-patch glue continues to type-check.
+    """
+    del aa_module  # unused; kept for signature compatibility
+    return _PINNED_CC_VERSION
 
 
 def _install_response_pascalcase_unhook(

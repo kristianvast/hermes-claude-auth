@@ -248,6 +248,45 @@ def test_apply_claude_code_bypass_preserves_existing_extra_headers(basic_api_kwa
     )
 
 
+def test_apply_claude_code_bypass_overrides_user_agent_to_sdk_cli(basic_api_kwargs):
+    """Force-override of user-agent + x-app must beat hermes's headers.
+
+    Hermes-agent sets ``user-agent: claude-cli/<detected> (external, cli)``
+    on the SDK client; without this override the billing header's
+    ``cc_entrypoint=sdk-cli`` contradicts the user-agent's ``cli`` and the
+    request gets routed to extra usage.
+    """
+    basic_api_kwargs["extra_headers"] = {
+        "user-agent": "claude-cli/2.1.72 (external, cli)",
+        "x-app": "wrong",
+    }
+
+    apply_claude_code_bypass(basic_api_kwargs, "2.1.112")
+
+    assert (
+        basic_api_kwargs["extra_headers"]["user-agent"]
+        == "claude-cli/2.1.112 (external, sdk-cli)"
+    )
+    assert basic_api_kwargs["extra_headers"]["x-app"] == "cli"
+
+
+def test_get_version_safely_pins_to_2_1_112():
+    """_get_version_safely must ignore the adapter module and return the
+    pinned CC version so the billing header's cc_version always agrees
+    with the user-agent's claude-cli/<version>."""
+    from anthropic_billing_bypass import _PINNED_CC_VERSION, _get_version_safely
+
+    class FakeAdapter:
+        _CLAUDE_CODE_VERSION_FALLBACK = "2.1.72"
+
+        @staticmethod
+        def _get_claude_code_version():
+            return "2.1.72"
+
+    assert _get_version_safely(FakeAdapter) == _PINNED_CC_VERSION
+    assert _PINNED_CC_VERSION == "2.1.112"
+
+
 def test_repair_tool_pairs_drops_orphaned_tool_use_and_result():
     messages = [
         {"role": "user", "content": [{"type": "text", "text": "hi"}]},

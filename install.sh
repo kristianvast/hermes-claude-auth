@@ -41,26 +41,39 @@ if [ ! -d "$SITE_PACKAGES" ]; then
     exit 1
 fi
 
+# --- Patch + bootstrap module ------------------------------------------------
 mkdir -p "$PATCHES_DIR"
 cp "$SCRIPT_DIR/anthropic_billing_bypass.py" "$PATCHES_DIR/anthropic_billing_bypass.py"
 chmod 644 "$PATCHES_DIR/anthropic_billing_bypass.py"
-printf "${GREEN}[✓] Copied patch to %s/${RESET}\n" "$PATCHES_DIR"
+cp "$SCRIPT_DIR/hermes_claude_auth_bootstrap.py" "$PATCHES_DIR/hermes_claude_auth_bootstrap.py"
+chmod 644 "$PATCHES_DIR/hermes_claude_auth_bootstrap.py"
+printf "${GREEN}[✓] Copied patch + bootstrap to %s/${RESET}\n" "$PATCHES_DIR"
 
+# --- Loader: .pth file -------------------------------------------------------
+# We use a .pth file rather than sitecustomize.py.  Only ONE sitecustomize
+# module can win on sys.path, and Homebrew/pyenv Pythons ship their own in the
+# stdlib dir (earlier on the path) which silently shadows a venv one — so the
+# hook never runs.  site.py executes the import-line of EVERY .pth file in
+# EVERY site dir, so a .pth always loads regardless of any sitecustomize.
+PTH_FILE="$SITE_PACKAGES/hermes_claude_auth.pth"
+cp "$SCRIPT_DIR/hermes_claude_auth.pth" "$PTH_FILE"
+chmod 644 "$PTH_FILE"
+printf "${GREEN}[✓] Installed .pth loader into %s${RESET}\n" "$PTH_FILE"
+
+# --- Migrate legacy sitecustomize.py installs --------------------------------
+# Older versions installed the hook as sitecustomize.py.  Remove ours (or
+# restore a backed-up foreign one) so we don't leave a dead, shadowed file.
 SITECUSTOMIZE="$SITE_PACKAGES/sitecustomize.py"
-
-if [ ! -f "$SITECUSTOMIZE" ]; then
-    cp "$SCRIPT_DIR/sitecustomize_hook.py" "$SITECUSTOMIZE"
-elif grep -q "$MARKER" "$SITECUSTOMIZE"; then
-    cp "$SCRIPT_DIR/sitecustomize_hook.py" "$SITECUSTOMIZE"
-else
-    BACKUP="$SITECUSTOMIZE.pre-hermes-claude-auth"
-    cp "$SITECUSTOMIZE" "$BACKUP"
-    printf "${YELLOW}[!] Backed up existing sitecustomize.py to %s${RESET}\n" "$BACKUP"
-    cp "$SCRIPT_DIR/sitecustomize_hook.py" "$SITECUSTOMIZE"
+SITE_BACKUP="$SITECUSTOMIZE.pre-hermes-claude-auth"
+if [ -f "$SITECUSTOMIZE" ] && grep -qF "$MARKER" "$SITECUSTOMIZE"; then
+    if [ -f "$SITE_BACKUP" ]; then
+        mv "$SITE_BACKUP" "$SITECUSTOMIZE"
+        printf "${YELLOW}[!] Migrated: restored original sitecustomize.py from backup${RESET}\n"
+    else
+        rm -f "$SITECUSTOMIZE"
+        printf "${YELLOW}[!] Migrated: removed legacy managed sitecustomize.py (now using .pth)${RESET}\n"
+    fi
 fi
-
-chmod 644 "$SITECUSTOMIZE"
-printf "${GREEN}[✓] Installed hook into %s${RESET}\n" "$SITECUSTOMIZE"
 
 # macOS: hermes-agent reads Claude subscription credentials from
 # ~/.claude/.credentials.json, but Claude Code on macOS stores them in
@@ -88,9 +101,12 @@ if systemctl --user is-active hermes-gateway.service >/dev/null 2>&1; then
     printf "${GREEN}[✓] Restarted hermes-gateway.service${RESET}\n"
 else
     printf "${YELLOW}[!] hermes-gateway not running — restart manually when ready${RESET}\n"
+    printf "    (e.g. 'hermes gateway restart')\n"
 fi
 
 printf "\n${GREEN}Installation complete.${RESET}\n"
-printf "  Patch:  %s/anthropic_billing_bypass.py\n" "$PATCHES_DIR"
-printf "  Hook:   %s\n" "$SITECUSTOMIZE"
-printf "  Venv:   %s\n" "$VENV_DIR"
+printf "  Patch:      %s/anthropic_billing_bypass.py\n" "$PATCHES_DIR"
+printf "  Bootstrap:  %s/hermes_claude_auth_bootstrap.py\n" "$PATCHES_DIR"
+printf "  Loader:     %s\n" "$PTH_FILE"
+printf "  Venv:       %s\n" "$VENV_DIR"
+printf "\n  Verify with: grep 'Bypass installed' ~/.hermes/logs/gateway.error.log\n"

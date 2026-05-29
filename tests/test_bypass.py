@@ -220,7 +220,7 @@ def test_apply_claude_code_bypass_injects_stainless_and_direct_browser_headers(
     assert extra_headers["anthropic-dangerous-direct-browser-access"] == "true"
     assert extra_headers["x-stainless-lang"] == "js"
     assert extra_headers["x-stainless-runtime"] == "node"
-    assert extra_headers["x-stainless-package-version"] == "0.81.0"
+    assert extra_headers["x-stainless-package-version"] == "0.208.0"
     assert extra_headers["x-stainless-retry-count"] == "0"
     assert extra_headers["x-stainless-timeout"] == "600"
     assert extra_headers["x-stainless-os"] in ("MacOS", "Linux", "Windows")

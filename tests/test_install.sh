@@ -68,31 +68,43 @@ python3 -m venv "$FAKE_HOME/.hermes/hermes-agent/venv"
 
 VENV_PYTHON="$FAKE_HOME/.hermes/hermes-agent/venv/bin/python"
 SITE_PACKAGES="$("$VENV_PYTHON" -c 'import site; print(site.getsitepackages()[0])')"
+PTH_FILE="$SITE_PACKAGES/hermes_claude_auth.pth"
 SITECUSTOMIZE="$SITE_PACKAGES/sitecustomize.py"
-BACKUP="$SITECUSTOMIZE.pre-hermes-claude-auth"
+SITE_BACKUP="$SITECUSTOMIZE.pre-hermes-claude-auth"
 PATCH_FILE="$FAKE_HOME/.hermes/patches/anthropic_billing_bypass.py"
+BOOTSTRAP_FILE="$FAKE_HOME/.hermes/patches/hermes_claude_auth_bootstrap.py"
 
-# Test 1: Fresh install
+# Test 1: Fresh install lays down the .pth loader, patch, and bootstrap.
 T1="Test 1: Fresh install"
 if "$REPO_DIR/install.sh" >/dev/null 2>&1; then
     ok=1
     assert_file_exists "$T1" "$PATCH_FILE" || ok=0
-    assert_file_exists "$T1" "$SITECUSTOMIZE" || ok=0
-    assert_file_contains "$T1" "$SITECUSTOMIZE" "# hermes-claude-auth managed" || ok=0
+    assert_file_exists "$T1" "$BOOTSTRAP_FILE" || ok=0
+    assert_file_exists "$T1" "$PTH_FILE" || ok=0
+    assert_file_contains "$T1" "$PTH_FILE" "# hermes-claude-auth managed" || ok=0
+    assert_file_contains "$T1" "$PTH_FILE" "hermes_claude_auth_bootstrap" || ok=0
     [ "$ok" -eq 1 ] && pass "$T1"
 else
     fail "$T1" "install.sh exited non-zero"
 fi
 
-# Test 2: Idempotent re-install
+# Test 1b: The .pth actually loads at interpreter startup (the whole point).
+T1b="Test 1b: .pth installs the import hook at startup"
+hook_present="$("$VENV_PYTHON" -c "import sys; print(any('_ClaudeCodeBypassFinder' in type(f).__name__ for f in sys.meta_path))" 2>/dev/null || echo error)"
+if [ "$hook_present" = "True" ]; then
+    pass "$T1b"
+else
+    fail "$T1b" "meta_path finder not installed (got: $hook_present)"
+fi
+
+# Test 2: Idempotent re-install — .pth marker appears exactly once.
 T2="Test 2: Idempotent re-install"
 if "$REPO_DIR/install.sh" >/dev/null 2>&1; then
     ok=1
-    assert_file_exists "$T2" "$SITECUSTOMIZE" || ok=0
-    assert_file_contains "$T2" "$SITECUSTOMIZE" "# hermes-claude-auth managed" || ok=0
-    count="$(grep -cF '# hermes-claude-auth managed' "$SITECUSTOMIZE" 2>/dev/null || true)"
-    if [ "$count" -gt 1 ]; then
-        fail "$T2" "marker duplicated ($count occurrences)"
+    assert_file_exists "$T2" "$PTH_FILE" || ok=0
+    count="$(grep -cF '# hermes-claude-auth managed' "$PTH_FILE" 2>/dev/null || true)"
+    if [ "$count" -ne 1 ]; then
+        fail "$T2" "marker count is $count, expected 1"
         ok=0
     fi
     [ "$ok" -eq 1 ] && pass "$T2"
@@ -100,39 +112,52 @@ else
     fail "$T2" "install.sh exited non-zero on re-run"
 fi
 
-# Test 3: Install over existing sitecustomize.py (no marker)
-T3="Test 3: Install over existing sitecustomize.py"
+# Test 3: A foreign (non-managed) sitecustomize.py is left untouched.
+T3="Test 3: Foreign sitecustomize.py untouched"
 printf 'import sys\n# some unrelated hook\n' > "$SITECUSTOMIZE"
 if "$REPO_DIR/install.sh" >/dev/null 2>&1; then
     ok=1
-    assert_file_exists "$T3" "$BACKUP" || ok=0
-    assert_file_contains "$T3" "$SITECUSTOMIZE" "# hermes-claude-auth managed" || ok=0
-    assert_file_contains "$T3" "$BACKUP" "# some unrelated hook" || ok=0
+    assert_file_exists "$T3" "$SITECUSTOMIZE" || ok=0
+    assert_file_contains "$T3" "$SITECUSTOMIZE" "# some unrelated hook" || ok=0
+    assert_file_not_exists "$T3" "$SITE_BACKUP" || ok=0
+    assert_file_exists "$T3" "$PTH_FILE" || ok=0
     [ "$ok" -eq 1 ] && pass "$T3"
 else
     fail "$T3" "install.sh exited non-zero"
 fi
+rm -f "$SITECUSTOMIZE"
 
-# Test 4: Uninstall (hook only)
-T4="Test 4: Uninstall (hook only)"
+# Test 3b: A legacy MANAGED sitecustomize.py is migrated away (removed).
+T3b="Test 3b: Legacy managed sitecustomize.py migrated"
+printf '# hermes-claude-auth managed\nimport sys\n' > "$SITECUSTOMIZE"
+if "$REPO_DIR/install.sh" >/dev/null 2>&1; then
+    ok=1
+    assert_file_not_exists "$T3b" "$SITECUSTOMIZE" || ok=0
+    assert_file_exists "$T3b" "$PTH_FILE" || ok=0
+    [ "$ok" -eq 1 ] && pass "$T3b"
+else
+    fail "$T3b" "install.sh exited non-zero"
+fi
+
+# Test 4: Uninstall removes the .pth loader but keeps the patch files.
+T4="Test 4: Uninstall (loader only)"
 if "$REPO_DIR/uninstall.sh" >/dev/null 2>&1; then
     ok=1
-    assert_file_exists "$T4" "$SITECUSTOMIZE" || ok=0
-    assert_file_contains "$T4" "$SITECUSTOMIZE" "# some unrelated hook" || ok=0
-    assert_file_not_exists "$T4" "$BACKUP" || ok=0
+    assert_file_not_exists "$T4" "$PTH_FILE" || ok=0
     assert_file_exists "$T4" "$PATCH_FILE" || ok=0
+    assert_file_exists "$T4" "$BOOTSTRAP_FILE" || ok=0
     [ "$ok" -eq 1 ] && pass "$T4"
 else
     fail "$T4" "uninstall.sh exited non-zero"
 fi
 
-# Test 5: Reinstall then uninstall --purge
+# Test 5: Reinstall then uninstall --purge removes everything.
 T5="Test 5: Reinstall then uninstall --purge"
-rm -f "$SITECUSTOMIZE"
 if "$REPO_DIR/install.sh" >/dev/null 2>&1 && "$REPO_DIR/uninstall.sh" --purge >/dev/null 2>&1; then
     ok=1
-    assert_file_not_exists "$T5" "$SITECUSTOMIZE" || ok=0
+    assert_file_not_exists "$T5" "$PTH_FILE" || ok=0
     assert_file_not_exists "$T5" "$PATCH_FILE" || ok=0
+    assert_file_not_exists "$T5" "$BOOTSTRAP_FILE" || ok=0
     assert_dir_not_exists "$T5" "$FAKE_HOME/.hermes/patches" || ok=0
     [ "$ok" -eq 1 ] && pass "$T5"
 else

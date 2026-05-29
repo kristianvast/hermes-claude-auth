@@ -40,9 +40,13 @@ def test_extract_first_user_message_text_with_empty_messages_returns_empty_strin
     assert _extract_first_user_message_text([]) == ""
 
 
-def test_compute_cch_known_values():
-    assert _compute_cch("hello world") == "b94d2"
-    assert _compute_cch("") == "e3b0c"
+def test_compute_cch_is_constant_zero():
+    # Claude Code 2.1.156 emits a fixed cch=00000 for OAuth auth (binary fn
+    # ``er_``) rather than a per-message content hash, so _compute_cch returns
+    # the constant regardless of input.
+    assert _compute_cch("hello world") == "00000"
+    assert _compute_cch("") == "00000"
+    assert _compute_cch("anything else entirely") == "00000"
 
 
 def test_compute_version_suffix_pads_short_text():

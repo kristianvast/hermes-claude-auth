@@ -26,34 +26,44 @@ cd hermes-claude-auth
 ```
 
 What `install.sh` does:
-- Copies `anthropic_billing_bypass.py` to `~/.hermes/patches/`
-- Installs the import hook as `sitecustomize.py` in the hermes venv's site-packages
+- Copies `anthropic_billing_bypass.py` and `hermes_claude_auth_bootstrap.py` to `~/.hermes/patches/`
+- Installs the loader as `hermes_claude_auth.pth` in the hermes venv's site-packages
+- Migrates away any legacy managed `sitecustomize.py` from older installs
 - Restarts `hermes-gateway.service` if running
+
+Verify it loaded:
+```bash
+grep 'Bypass installed' ~/.hermes/logs/gateway.error.log
+```
 
 ## Uninstall
 ```bash
-./uninstall.sh          # remove hook only
-./uninstall.sh --purge  # remove hook + patch file
+./uninstall.sh          # remove loader only
+./uninstall.sh --purge  # remove loader + patch + bootstrap files
 ```
 
 ## How it works
-1. **Billing header**: SHA-256 signed `x-anthropic-billing-header` injected as `system[0]`
+1. **Billing header**: `x-anthropic-billing-header` injected as `system[0]` — `cc_version=<ver>.<sig>` where `<sig>` is the SHA-256 version suffix (salt `59cf53e54c78`, sampling message chars 4/7/20, matching Claude Code's `o9q`), plus the fixed `cch=00000` the genuine client emits for OAuth auth
 2. **System prompt relocation**: Non-identity system entries moved to the first user message as `<system-reminder>` blocks
 3. **Beta flags**: Adds `prompt-caching-scope-2026-01-05` and `advisor-tool-2026-03-01`
-4. **Stainless SDK spoof**: Lowercase `x-stainless-*` headers + `anthropic-dangerous-direct-browser-access` + `?beta=true` query param matching real Claude Code 2.1.112
+4. **Stainless SDK spoof**: Lowercase `x-stainless-*` headers (package version `0.208.0`) + `anthropic-dangerous-direct-browser-access` + `?beta=true` query param matching real Claude Code 2.1.156
 5. **Tool name namespacing**: Hermes's `mcp_bash` is rewritten to `mcp__hermes__Bash` outbound; the response normalizer unwraps it back to `bash` so hermes's tool dispatcher resolves the registered name without auto-repair noise
 6. **Tool pair repair**: Orphaned `tool_use` / `tool_result` blocks (left by long conversations or partial summaries) are stripped before signing — prevents HTTP 400 (upstream PR #136)
 7. **Haiku effort stripping**: `effort` parameter is removed for haiku models that reject it with HTTP 400 (upstream PR #126)
 8. **Temperature fix**: Strips non-default `temperature` on Opus 4.6 adaptive thinking, which otherwise rejects with HTTP 400
 9. **Account metadata**: Maps `~/.claude.json::oauthAccount.accountUuid` to `metadata.user_id` (Anthropic rejected the older `account_uuid` key with HTTP 400 on 2026-04-29)
 
-Installed through a `sitecustomize.py` MetaPathFinder hook, so it runs at interpreter startup with no source modifications.
+Installed through a `.pth` file that imports `hermes_claude_auth_bootstrap`, which registers a `MetaPathFinder`. It runs at interpreter startup with no source modifications.
+
+> **Why a `.pth` and not `sitecustomize.py`?** Only one `sitecustomize` module can win on `sys.path`, and Homebrew/pyenv Pythons ship their own in the stdlib dir (earlier on the path) which silently shadows a venv one — so the hook never runs and every OAuth request 400s with *"Third-party apps now draw from extra usage."* `site.py` executes the import-line of **every** `.pth` file in **every** site directory, so a `.pth` always loads regardless of any `sitecustomize`.
 
 ## What gets modified
 | File | Action |
 |------|--------|
 | `~/.hermes/patches/anthropic_billing_bypass.py` | Created |
-| `<venv>/lib/pythonX.Y/site-packages/sitecustomize.py` | Created or replaced |
+| `~/.hermes/patches/hermes_claude_auth_bootstrap.py` | Created |
+| `<venv>/lib/pythonX.Y/site-packages/hermes_claude_auth.pth` | Created |
+| `<venv>/lib/pythonX.Y/site-packages/sitecustomize.py` (legacy) | Removed if managed by an older install |
 | hermes-agent source files | NOT modified |
 
 ## Compatibility

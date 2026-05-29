@@ -1,0 +1,2 @@
+# hermes-claude-auth managed — do not remove this marker
+import os, sys; _hcap = os.environ.get('HERMES_PATCHES_DIR', os.path.expanduser('~/.hermes/patches')); (os.path.isdir(_hcap) and _hcap not in sys.path and sys.path.insert(0, _hcap)); __import__('hermes_claude_auth_bootstrap')

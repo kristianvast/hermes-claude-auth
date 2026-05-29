@@ -20,7 +20,7 @@ def _clear_bypass_finders():
 @pytest.fixture
 def hook_module(monkeypatch):
     _clear_bypass_finders()
-    module = importlib.import_module("sitecustomize_hook")
+    module = importlib.import_module("hermes_claude_auth_bootstrap")
     module = importlib.reload(module)
     _clear_bypass_finders()
     yield module
@@ -28,7 +28,7 @@ def hook_module(monkeypatch):
 
 
 def test_install_hook_registers_finder(hook_module):
-    hook_module._install_hook()
+    hook_module.install_hook()
 
     assert any(
         finder.__class__.__name__ == "_ClaudeCodeBypassFinder"
@@ -50,7 +50,7 @@ def test_finder_only_targets_agent_anthropic_adapter(hook_module, monkeypatch):
         return spec if fullname == hook_module._TARGET_MODULE else None
 
     monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
-    hook_module._install_hook()
+    hook_module.install_hook()
     finder = next(
         finder
         for finder in sys.meta_path
@@ -83,7 +83,7 @@ def test_finder_sets_patched_flag_and_stops_repatching(hook_module, monkeypatch)
     monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
     monkeypatch.setitem(sys.modules, "anthropic_billing_bypass", bypass_module)
 
-    hook_module._install_hook()
+    hook_module.install_hook()
     finder = next(
         finder
         for finder in sys.meta_path

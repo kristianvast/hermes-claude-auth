@@ -11,6 +11,19 @@ ports its bypass behaviors to Python.
 
 Version history
 ---------------
+- 1.6.0 (2026-05-29): Match Claude Code 2.1.156's billing header exactly.
+  Verified against the installed native client binary
+  (``~/.local/share/claude/versions/2.1.156``, function ``er_``): the
+  genuine client now emits a **literal** ``cch=00000;`` for OAuth auth
+  rather than a per-message content hash — so we stop computing
+  ``sha256(first_user_text)[:5]`` (an anomaly that no longer matches real
+  traffic) and emit the constant.  The version-suffix algorithm (``o9q``:
+  ``sha256(salt + msg[4,7,20] + version)[:3]``, salt ``59cf53e54c78``) is
+  unchanged and confirmed byte-for-byte.  Also bumped the spoofed Stainless
+  SDK version to ``0.208.0`` (the ``@anthropic-ai/sdk`` version bundled in
+  2.1.156; was ``0.81.0``).  NOTE: the loader moved from ``sitecustomize.py``
+  to a ``.pth`` file — Homebrew Pythons ship their own stdlib
+  ``sitecustomize.py`` that shadowed the venv one, so the hook never ran.
 - 1.5.0 (2026-05-06): Fix literal ``\\n`` escapes in system-reminder text,
   lowercase Stainless headers (matches upstream JS SDK), restore Opus 4.6
   temperature stripping, port ``repair_tool_pairs`` (upstream PR #136) and
@@ -37,7 +50,7 @@ References
 
 from __future__ import annotations
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 import hashlib
 import inspect
@@ -56,13 +69,23 @@ logger = logging.getLogger("anthropic_billing_bypass")
 # ---------------------------------------------------------------------------
 
 # Shared salt shipped in the Claude Code CLI binary; Anthropic's server uses
-# this to verify billing-header signatures.
+# this to verify billing-header signatures.  Confirmed still present in
+# 2.1.156 (``CXO="59cf53e54c78"``) and used by the version-suffix hash.
 _BILLING_SALT = "59cf53e54c78"
 
 # Claude Code 2.1.112+ reports ``sdk-cli`` instead of legacy ``cli``.  A
 # mismatch with x-stainless-* headers routes the request to third-party
-# billing.
+# billing.  (In 2.1.156 the genuine client reads this from the
+# ``CLAUDE_CODE_ENTRYPOINT`` env var, defaulting to ``unknown``; the value is
+# informational and not part of the signed suffix.)
 _BILLING_ENTRYPOINT = "sdk-cli"
+
+# The ``cch`` field.  Older clients carried a per-message content hash here;
+# Claude Code 2.1.156 emits a fixed ``00000`` for OAuth/subscription auth
+# (binary fn ``er_``: ``cch=00000;`` for non-bedrock/aws/mantle auth).  We
+# emit the same constant so the header is indistinguishable from the genuine
+# client — a real sha256 hash here is now an anomaly.
+_BILLING_CCH = "00000"
 
 # Sentinel strings — entries in system[] starting with these are kept;
 # everything else is relocated to the first user message.
@@ -78,7 +101,7 @@ _MCP_HERMES_NAMESPACE = "mcp__hermes__"
 # Stainless-generated SDK headers Claude Code 2.1.112 sends.  Lowercase to
 # match the JS SDK output exactly (HTTP headers are case-insensitive but
 # upstream's spoof uses lowercase, and so does our pre-merge code).
-_STAINLESS_PACKAGE_VERSION = "0.81.0"
+_STAINLESS_PACKAGE_VERSION = "0.208.0"
 _STAINLESS_NODE_VERSION = "v22.11.0"
 
 # OAuth-only beta flags appended on top of hermes-agent's built-in
@@ -219,7 +242,10 @@ def _extract_first_user_message_text(messages: List[Dict[str, Any]]) -> str:
 
 
 def _compute_cch(message_text: str) -> str:
-    return hashlib.sha256(message_text.encode("utf-8")).hexdigest()[:5]
+    """Genuine Claude Code 2.1.156 emits a fixed ``cch=00000`` for OAuth auth
+    (see ``_BILLING_CCH``).  The ``message_text`` argument is retained for
+    signature compatibility but no longer hashed."""
+    return _BILLING_CCH
 
 
 def _compute_version_suffix(message_text: str, version: str) -> str:

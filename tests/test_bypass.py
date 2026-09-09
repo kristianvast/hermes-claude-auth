@@ -955,3 +955,119 @@ def test_strip_thinking_from_replay_leaves_non_assistant():
     _strip_thinking_from_replay(messages)
 
     assert messages == original
+
+
+# ── cache_control TTL ordering tests (v1.7.1) ───────────────────────────────
+
+
+def _collect_cache_controls_in_order(api_kwargs):
+    """Yield cache_control dicts in Anthropic processing order: tools, system, messages."""
+    for tool in api_kwargs.get("tools") or []:
+        if isinstance(tool, dict) and isinstance(tool.get("cache_control"), dict):
+            yield tool["cache_control"]
+    for entry in api_kwargs.get("system") or []:
+        if isinstance(entry, dict) and isinstance(entry.get("cache_control"), dict):
+            yield entry["cache_control"]
+    for message in api_kwargs.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        if isinstance(message.get("cache_control"), dict):
+            yield message["cache_control"]
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and isinstance(block.get("cache_control"), dict):
+                    yield block["cache_control"]
+
+
+def _assert_no_1h_after_5m(api_kwargs):
+    """Walk markers in Anthropic order and fail if a 1h block follows a 5m one."""
+    seen_5m = False
+    for marker in _collect_cache_controls_in_order(api_kwargs):
+        ttl = marker.get("ttl")
+        effective = "5m" if ttl is None else ttl
+        if effective == "5m":
+            seen_5m = True
+        elif effective == "1h":
+            assert not seen_5m, "1h cache_control block follows a 5m block"
+
+
+def test_identity_ttl_downgrades_when_tools_carry_5m(basic_api_kwargs):
+    basic_api_kwargs["tools"] = [
+        {
+            "name": "x",
+            "input_schema": {"type": "object"},
+            "cache_control": {"type": "ephemeral"},
+        },
+    ]
+
+    apply_claude_code_bypass(basic_api_kwargs, "2.1.117")
+
+    identity_entry = basic_api_kwargs["system"][1]
+    assert identity_entry["text"] == _SYSTEM_IDENTITY
+    assert identity_entry["cache_control"] == {"type": "ephemeral"}
+
+
+def test_identity_ttl_downgrades_when_message_carries_5m(basic_api_kwargs):
+    basic_api_kwargs["messages"][0]["content"] = [
+        {"type": "text", "text": "hello world", "cache_control": {"type": "ephemeral"}},
+    ]
+
+    apply_claude_code_bypass(basic_api_kwargs, "2.1.117")
+
+    identity_entry = basic_api_kwargs["system"][1]
+    assert identity_entry["text"] == _SYSTEM_IDENTITY
+    assert identity_entry["cache_control"] == {"type": "ephemeral"}
+
+
+def test_identity_ttl_stays_1h_when_all_markers_are_1h(basic_api_kwargs):
+    """Guard: when every existing marker is already 1h, identity stays 1h."""
+    basic_api_kwargs["tools"] = [
+        {
+            "name": "x",
+            "input_schema": {"type": "object"},
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        },
+    ]
+    basic_api_kwargs["messages"][0]["content"] = [
+        {
+            "type": "text",
+            "text": "hello world",
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        },
+    ]
+
+    apply_claude_code_bypass(basic_api_kwargs, "2.1.117")
+
+    identity_entry = basic_api_kwargs["system"][1]
+    assert identity_entry["text"] == _SYSTEM_IDENTITY
+    assert identity_entry["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+
+def test_no_1h_marker_follows_a_5m_marker():
+    """Invariant: the identity entry must never emit 1h after existing 5m markers."""
+    api_kwargs = {
+        "system": [{"type": "text", "text": "some guidance"}],
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}},
+                ],
+            },
+        ],
+        "tools": [
+            {
+                "name": "delegate_tool",
+                "input_schema": {"type": "object"},
+                "cache_control": {"type": "ephemeral"},
+            },
+        ],
+        "model": "claude-opus-4-6-20260101",
+    }
+
+    apply_claude_code_bypass(api_kwargs, "2.1.117")
+
+    identity_entry = api_kwargs["system"][1]
+    assert identity_entry["text"] == _SYSTEM_IDENTITY
+    _assert_no_1h_after_5m(api_kwargs)

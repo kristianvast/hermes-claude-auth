@@ -124,7 +124,7 @@ import sys
 import time
 import traceback
 import uuid
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Iterator, List, Optional, Set
 
 logger = logging.getLogger("anthropic_billing_bypass")
 
@@ -1031,6 +1031,45 @@ def _prepend_to_first_user_message(
         return
 
 
+def _request_cache_ttl(api_kwargs: Dict[str, Any]) -> str:
+    """Return the cache TTL to use for the injected identity system entry.
+
+    Anthropic rejects a ttl='1h' cache_control block that follows a ttl='5m'
+    block (blocks are processed in the order tools, system, messages).  We
+    therefore derive the identity entry's TTL from every existing
+    cache_control marker in the request.  If any marker is missing a ttl
+    (which defaults to 5m) or explicitly sets ttl='5m', we must also emit
+    5m.  Only when every existing marker is ttl='1h' may we emit 1h.
+    Requests with no markers at all keep the historical 1h behaviour.
+    """
+
+    def _iter_markers() -> Iterator[Dict[str, Any]]:
+        for tool in api_kwargs.get("tools") or []:
+            if isinstance(tool, dict) and isinstance(tool.get("cache_control"), dict):
+                yield tool["cache_control"]
+        for entry in api_kwargs.get("system") or []:
+            if isinstance(entry, dict) and isinstance(entry.get("cache_control"), dict):
+                yield entry["cache_control"]
+        for message in api_kwargs.get("messages") or []:
+            if not isinstance(message, dict):
+                continue
+            if isinstance(message.get("cache_control"), dict):
+                yield message["cache_control"]
+            content = message.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and isinstance(
+                        block.get("cache_control"), dict
+                    ):
+                        yield block["cache_control"]
+
+    for marker in _iter_markers():
+        ttl = marker.get("ttl")
+        if ttl is None or ttl == "5m":
+            return "5m"
+    return "1h"
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -1083,6 +1122,14 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
         return
     billing_entry = {"type": "text", "text": billing_value}
 
+    # Derive the identity cache TTL from existing markers before we rewrite
+    # system[].  Order relative to _prepend_to_first_user_message does not
+    # matter because that helper copies cache_control keys through unchanged.
+    identity_cache_ttl = _request_cache_ttl(api_kwargs)
+    identity_cache_control: Dict[str, str] = {"type": "ephemeral"}
+    if identity_cache_ttl == "1h":
+        identity_cache_control["ttl"] = "1h"
+
     kept: List[Any] = []
     moved_texts: List[str] = []
     identity_seen = False
@@ -1111,7 +1158,7 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
             kept.append({
                 "type": "text",
                 "text": _SYSTEM_IDENTITY,
-                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                "cache_control": dict(identity_cache_control),
             })
             if rest:
                 moved_texts.append(rest)
@@ -1123,7 +1170,7 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
         kept.insert(0, {
             "type": "text",
             "text": _SYSTEM_IDENTITY,
-            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            "cache_control": dict(identity_cache_control),
         })
 
     api_kwargs["system"] = [billing_entry] + kept

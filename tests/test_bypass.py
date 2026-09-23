@@ -811,6 +811,96 @@ def test_bypass_injects_cache_control_on_identity(basic_api_kwargs):
     assert identity_entry["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
 
 
+def _cache_ttls_in_wire_order(api_kwargs):
+    """TTL of every cache breakpoint in Anthropic's processing order:
+    tools -> system -> messages (content blocks included)."""
+    ttls = []
+
+    def _take(block):
+        cc = block.get("cache_control") if isinstance(block, dict) else None
+        if isinstance(cc, dict):
+            ttls.append(cc.get("ttl", "5m"))
+
+    for tool in api_kwargs.get("tools") or []:
+        _take(tool)
+    system = api_kwargs.get("system")
+    for block in system if isinstance(system, list) else []:
+        _take(block)
+    for msg in api_kwargs.get("messages") or []:
+        _take(msg)
+        content = msg.get("content") if isinstance(msg, dict) else None
+        for block in content if isinstance(content, list) else []:
+            _take(block)
+    return ttls
+
+
+def _assert_no_1h_after_5m(api_kwargs):
+    ttls = _cache_ttls_in_wire_order(api_kwargs)
+    if "5m" in ttls:
+        assert "1h" not in ttls[ttls.index("5m"):], ttls
+
+
+def _tool_loop_cache_kwargs(basic_api_kwargs, tool_marker):
+    """hermes-agent 0.21.x tool-loop layout: last tool carries a marker."""
+    kwargs = copy.deepcopy(basic_api_kwargs)
+    kwargs["tools"] = [
+        {"name": "terminal", "description": "t", "input_schema": {"type": "object"}},
+        {
+            "name": "read_file",
+            "description": "r",
+            "input_schema": {"type": "object"},
+            "cache_control": dict(tool_marker),
+        },
+    ]
+    return kwargs
+
+
+def test_identity_follows_5m_tool_marker(basic_api_kwargs):
+    """0.21.x + default cache_ttl=5m: a 1h identity after a 5m tool marker
+    is a hard 400 ("a ttl='1h' cache_control block must not come after a
+    ttl='5m' cache_control block").  Identity must drop to 5m."""
+    kwargs = _tool_loop_cache_kwargs(basic_api_kwargs, {"type": "ephemeral"})
+
+    apply_claude_code_bypass(kwargs, "2.1.217")
+
+    assert kwargs["system"][1]["cache_control"] == {"type": "ephemeral"}
+    _assert_no_1h_after_5m(kwargs)
+
+
+def test_identity_follows_explicit_5m_tool_marker(basic_api_kwargs):
+    kwargs = _tool_loop_cache_kwargs(
+        basic_api_kwargs, {"type": "ephemeral", "ttl": "5m"}
+    )
+
+    apply_claude_code_bypass(kwargs, "2.1.217")
+
+    assert kwargs["system"][1]["cache_control"] == {"type": "ephemeral"}
+    _assert_no_1h_after_5m(kwargs)
+
+
+def test_identity_keeps_1h_after_1h_tool_marker(basic_api_kwargs):
+    kwargs = _tool_loop_cache_kwargs(
+        basic_api_kwargs, {"type": "ephemeral", "ttl": "1h"}
+    )
+
+    apply_claude_code_bypass(kwargs, "2.1.217")
+
+    assert kwargs["system"][1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    _assert_no_1h_after_5m(kwargs)
+
+
+def test_identity_marker_is_not_shared_between_requests(basic_api_kwargs):
+    """The marker dict must be a fresh copy; mutating one request's marker
+    must not leak into the module default or the next request."""
+    first = copy.deepcopy(basic_api_kwargs)
+    apply_claude_code_bypass(first, "2.1.217")
+    first["system"][1]["cache_control"]["ttl"] = "mutated"
+
+    second = copy.deepcopy(basic_api_kwargs)
+    apply_claude_code_bypass(second, "2.1.217")
+    assert second["system"][1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+
 def test_bypass_injects_context_management_via_extra_body(basic_api_kwargs):
     """context_management should be injected via extra_body when thinking is active."""
     basic_api_kwargs["thinking"] = {"type": "adaptive"}

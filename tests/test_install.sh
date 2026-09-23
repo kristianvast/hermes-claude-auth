@@ -64,6 +64,14 @@ assert_dir_not_exists() {
 export HOME="$FAKE_HOME"
 unset HERMES_HOME
 
+# Keep install.sh away from the real user's systemd: without this stub a test
+# run restarts the live hermes-gateway.service.
+STUB_BIN="$FAKE_HOME/stubbin"
+mkdir -p "$STUB_BIN"
+printf '#!/bin/sh\nexit 1\n' > "$STUB_BIN/systemctl"
+chmod +x "$STUB_BIN/systemctl"
+export PATH="$STUB_BIN:$PATH"
+
 mkdir -p "$FAKE_HOME/.hermes/hermes-agent"
 python3 -m venv "$FAKE_HOME/.hermes/hermes-agent/venv"
 mkdir -p "$FAKE_HOME/.hermes/hermes-agent/.git/hooks"
@@ -86,9 +94,28 @@ if "$REPO_DIR/install.sh" >/dev/null 2>&1; then
     assert_file_exists "$T1" "$BOOTSTRAP_FILE" || ok=0
     assert_file_contains "$T1" "$PTH_FILE" "import _hermes_claude_auth_bootstrap" || ok=0
     assert_file_contains "$T1" "$BOOTSTRAP_FILE" "# hermes-claude-auth managed" || ok=0
+    assert_file_exists "$T1" "$POST_MERGE_HOOK" || ok=0
+    if [ ! -x "$POST_MERGE_HOOK" ]; then
+        fail "$T1" "post-merge hook not executable"; ok=0
+    fi
+    if ! "$REPO_DIR/install.sh" --check >/dev/null 2>&1; then
+        fail "$T1" "install.sh --check fails right after a fresh install"; ok=0
+    fi
     [ "$ok" -eq 1 ] && pass "$T1"
 else
     fail "$T1" "install.sh exited non-zero"
+fi
+
+# Test 1b: --check detects a wiped .pth hook, and the post-merge hook repairs it
+T1B="Test 1b: post-merge hook restores a wiped .pth hook"
+rm -f "$PTH_FILE" "$BOOTSTRAP_FILE"
+if "$REPO_DIR/install.sh" --check >/dev/null 2>&1; then
+    fail "$T1B" "--check passed with the .pth hook missing"
+elif HERMES_CLAUDE_AUTH_DIR="$REPO_DIR" "$POST_MERGE_HOOK" >/dev/null 2>&1 \
+    && "$REPO_DIR/install.sh" --check >/dev/null 2>&1; then
+    pass "$T1B"
+else
+    fail "$T1B" "post-merge hook did not restore a passing install"
 fi
 
 # Test 2: Idempotent re-install

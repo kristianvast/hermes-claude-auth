@@ -1036,6 +1036,35 @@ def _prepend_to_first_user_message(
 # ---------------------------------------------------------------------------
 
 
+_IDENTITY_CACHE_CONTROL_1H: Dict[str, str] = {"type": "ephemeral", "ttl": "1h"}
+_IDENTITY_CACHE_CONTROL_5M: Dict[str, str] = {"type": "ephemeral"}
+
+
+def _identity_cache_control(api_kwargs: Dict[str, Any]) -> Dict[str, str]:
+    """Pick the cache_control for the relocated system identity block.
+
+    Anthropic processes cache breakpoints in the order ``tools`` -> ``system``
+    -> ``messages`` and rejects (HTTP 400) a ``ttl='1h'`` block that comes
+    after a ``ttl='5m'`` one.  hermes-agent 0.21.x started putting a cache
+    marker on the last tool (tool-loop cache layout) with the session TTL,
+    which is ``5m`` by default.  A hard-coded ``1h`` identity marker then
+    lands *after* that ``5m`` tool marker and every request fails with
+    ``system.1.cache_control.ttl: a ttl='1h' cache_control block must not
+    come after a ttl='5m' cache_control block``.
+
+    Rule: if any tool carries a 5m marker (no ``ttl`` == 5m), the identity
+    must be 5m too; otherwise keep the historical 1h marker (older
+    hermes-agent never marks tools, so behaviour there is unchanged).
+    """
+    tools = api_kwargs.get("tools")
+    if isinstance(tools, list):
+        for tool in tools:
+            cc = tool.get("cache_control") if isinstance(tool, dict) else None
+            if isinstance(cc, dict) and cc.get("ttl", "5m") != "1h":
+                return _IDENTITY_CACHE_CONTROL_5M
+    return _IDENTITY_CACHE_CONTROL_1H
+
+
 def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
     """Apply all OAuth bypass transforms in place.
 
@@ -1083,6 +1112,8 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
         return
     billing_entry = {"type": "text", "text": billing_value}
 
+    identity_cache_control = _identity_cache_control(api_kwargs)
+
     kept: List[Any] = []
     moved_texts: List[str] = []
     identity_seen = False
@@ -1111,7 +1142,7 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
             kept.append({
                 "type": "text",
                 "text": _SYSTEM_IDENTITY,
-                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                "cache_control": dict(identity_cache_control),
             })
             if rest:
                 moved_texts.append(rest)
@@ -1123,7 +1154,7 @@ def apply_claude_code_bypass(api_kwargs: Dict[str, Any], version: str) -> None:
         kept.insert(0, {
             "type": "text",
             "text": _SYSTEM_IDENTITY,
-            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            "cache_control": dict(identity_cache_control),
         })
 
     api_kwargs["system"] = [billing_entry] + kept
@@ -1803,7 +1834,10 @@ def _rl_wrap_call(original_method):
     """Wrap an AIAgent API-call method with subscription rate-limit auto-wait."""
 
     def wrapper(self, *args: Any, **kwargs: Any):
-        if not _rl_autowait_enabled():
+        # Claude-subscription windows only: a 429 from another provider
+        # (openai-codex usage cap, openrouter, ...) must reach Hermes core so
+        # fallback_providers engage instead of a blind 5-minute sleep loop.
+        if not _rl_autowait_enabled() or getattr(self, "provider", None) != "anthropic":
             return original_method(self, *args, **kwargs)
         attempt = 0
         while True:
@@ -1887,8 +1921,13 @@ def _install_pool_select_hook() -> None:
 
     original_select = CredentialPool.select
 
-    def hooked_select(self: Any) -> Any:
-        entry = original_select(self)
+    def hooked_select(self: Any, *args: Any, **kwargs: Any) -> Any:
+        # Signature-transparent: hermes-agent 0.21.x added a keyword-only
+        # ``model`` parameter to CredentialPool.select().  A rigid
+        # ``(self)`` wrapper raises TypeError on every model-aware call
+        # site (agent_runtime_helpers, runtime_provider), which surfaces as
+        # "Model resolution failed" / "could not start the assistant".
+        entry = original_select(self, *args, **kwargs)
         if entry is not None and getattr(self, "provider", None) == "anthropic":
             uuid_val = getattr(entry, "account_uuid", None)
             if isinstance(uuid_val, str) and uuid_val:

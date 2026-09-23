@@ -71,10 +71,23 @@ if $CHECK_ONLY; then
         fi
     done
 
-    if [[ -f "$SITECUSTOMIZE" ]] && grep -q "$MARKER" "$SITECUSTOMIZE"; then
-        printf "${GREEN}[✓] sitecustomize hook present${RESET}\n"
+    # The hook is loaded through a .pth shim that imports the bootstrap module
+    # (see install_hook_into below). A sitecustomize.py carrying the marker is
+    # also accepted: the Antigravity coexistence loader embeds the Claude hook
+    # that way.
+    CHECK_PTH="$SITE_PACKAGES/$PTH_NAME"
+    CHECK_BOOTSTRAP="$SITE_PACKAGES/$BOOTSTRAP_NAME"
+    if [[ -f "$CHECK_PTH" ]] && grep -q "import ${BOOTSTRAP_NAME%.py}" "$CHECK_PTH" \
+        && [[ -f "$CHECK_BOOTSTRAP" ]] && grep -q "$MARKER" "$CHECK_BOOTSTRAP"; then
+        printf "${GREEN}[✓] .pth hook present (%s)${RESET}\n" "$CHECK_PTH"
+        if ! cmp -s "$CHECK_BOOTSTRAP" "$SCRIPT_DIR/$BOOTSTRAP_NAME"; then
+            printf "${YELLOW}[!] DRIFT: %s differs from repo${RESET}\n" "$CHECK_BOOTSTRAP"
+            ALL_OK=false
+        fi
+    elif [[ -f "$SITECUSTOMIZE" ]] && grep -q "$MARKER" "$SITECUSTOMIZE"; then
+        printf "${GREEN}[✓] sitecustomize hook present (%s)${RESET}\n" "$SITECUSTOMIZE"
     else
-        printf "${RED}[✗] sitecustomize hook MISSING or outdated${RESET}\n"
+        printf "${RED}[✗] hook MISSING: neither %s nor a managed sitecustomize.py found${RESET}\n" "$CHECK_PTH"
         ALL_OK=false
     fi
 

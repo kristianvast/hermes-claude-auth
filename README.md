@@ -114,7 +114,11 @@ ways:
 
 ### Two-layer defense
 
-**Layer 1 — git hooks via `core.hooksPath` (outside the repo):**
+**Layer 1 — git hooks via `core.hooksPath` (outside the repo, Windows):**
+
+On Linux/macOS `install.sh` installs `post-merge-hook.sh` into
+`.git/hooks/post-merge` instead; it runs `install.sh --check` after each merge
+and `install.sh --post-update` only when the hook is missing or drifted.
 
 ```bash
 # From inside your hermes-agent checkout:
